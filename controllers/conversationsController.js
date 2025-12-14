@@ -5,7 +5,9 @@ import KnowledgeBase from '../models/KnowledgeBase.js';
 import { buildSystemPrompt } from '../services/promptService.js';
 import { getAIResponse, getStreamingAIResponse } from '../services/openaiService.js';
 import { textToSpeech } from '../services/elevenLabsService.js';
+import { getSentimentContext } from '../services/sentimentService.js';
 import { config } from '../config/index.js';
+import { mergeConversationAudio, deleteTemporaryAudioSegments } from '../services/audioMergeService.js';
 
 /**
  * Start a new conversation
@@ -140,9 +142,18 @@ export const startConversation = async (req, res) => {
             voiceId: actualVoiceId || config.elevenlabs.voiceId,
             modelId: speechSettings.modelId || config.elevenlabs.modelId,
             stability: speechSettings.stability ?? 0.5,
-            similarity_boost: speechSettings.similarityBoost ?? 0.75
+            similarity_boost: speechSettings.similarityBoost ?? 0.75,
+            type: 'conversation' // Will be saved as temporary segment
           });
-          // Return URL to access the audio from GridFS
+          
+          // Track this audio segment in conversation for later merging
+          if (conversation && greetingAudioFileId) {
+            conversation.audioSegments = conversation.audioSegments || [];
+            conversation.audioSegments.push(greetingAudioFileId);
+            await conversation.save();
+          }
+          
+          // Return URL to access the audio from GridFS (temporary)
           initialAudioUrl = `/api/audio/${greetingAudioFileId}`;
         } catch (ttsError) {
           console.error('Error generating initial greeting audio:', ttsError);
@@ -188,6 +199,56 @@ export const chat = async (req, res) => {
       return res.status(404).json({ error: 'Conversation not found' });
     }
 
+    // Get agent first to check functions and get settings
+    const agent = agentId ? await Agent.findOne({ _id: agentId, userId: req.userId }) : null;
+    const speechSettings = agent?.speechSettings || {};
+    const openaiModel = speechSettings.openaiModel || 'gpt-4';
+    const language = speechSettings.language || 'en';
+    const functions = agent?.functions || [];
+    
+    // Build OpenAI tools (function definitions) from agent functions
+    // The AI will decide when to call these functions based on the conversation
+    const tools = [];
+    let shouldEndCall = false;
+    let triggeredFunction = null;
+    
+    for (const func of functions) {
+      if (!func || !func.enabled) continue;
+      
+      if (func.name === 'end_call') {
+        // Define end_call as an OpenAI function
+        tools.push({
+          type: 'function',
+          function: {
+            name: 'end_call',
+            description: func.description || 'End the call when the client wants to end the conversation, says goodbye, or indicates they don\'t want to talk anymore. Use this when the conversation should be terminated.',
+            parameters: {
+              type: 'object',
+              properties: {
+                reason: {
+                  type: 'string',
+                  description: 'The reason for ending the call (e.g., "client said goodbye", "client no longer wants to talk")'
+                }
+              },
+              required: ['reason']
+            }
+          }
+        });
+        console.log('📋 Added end_call function to OpenAI tools');
+      }
+    }
+
+    // Analyze sentiment from user message to understand emotional tone
+    let sentimentContext = '';
+    try {
+      const sentimentResult = await getSentimentContext(message);
+      sentimentContext = sentimentResult.context;
+      console.log('🎭 Sentiment detected:', sentimentResult.sentiment);
+    } catch (error) {
+      console.error('Error analyzing sentiment:', error);
+      // Continue without sentiment if analysis fails
+    }
+
     // Add user message
     conversation.messages.push({
       role: 'user',
@@ -195,16 +256,20 @@ export const chat = async (req, res) => {
     });
 
     // Convert messages to format expected by OpenAI
-    const messagesForOpenAI = conversation.messages.map(msg => ({
-      role: msg.role,
-      content: msg.content
-    }));
-
-    // Get agent speech settings to use the correct OpenAI model and language
-    const agent = agentId ? await Agent.findOne({ _id: agentId, userId: req.userId }) : null;
-    const speechSettings = agent?.speechSettings || {};
-    const openaiModel = speechSettings.openaiModel || 'gpt-4';
-    const language = speechSettings.language || 'en';
+    // Add sentiment context to help AI understand user's emotional state
+    const messagesForOpenAI = conversation.messages.map((msg, index, array) => {
+      // Add sentiment context to the latest user message
+      if (msg.role === 'user' && index === array.length - 1 && sentimentContext) {
+        return {
+          role: msg.role,
+          content: `${sentimentContext}${msg.content}`
+        };
+      }
+      return {
+        role: msg.role,
+        content: msg.content
+      };
+    });
     
     // Update system prompt with language if conversation doesn't have it yet
     // This ensures language is applied to all responses
@@ -237,13 +302,16 @@ export const chat = async (req, res) => {
     let fullResponse = '';
     let accumulatedText = '';
 
-    // Stream the response from OpenAI
-    const { content: aiResponse, tokensUsed } = await getStreamingAIResponse(
+    // Stream the response from OpenAI with function calling support
+    // Only include tools if end_call function is enabled
+    const { content: aiResponse, tokensUsed, functionCalls } = await getStreamingAIResponse(
       messagesForOpenAI,
       {
         model: openaiModel,
         temperature: 0.7,
-        max_tokens: 500
+        max_tokens: 500,
+        tools: tools.length > 0 ? tools : undefined, // Only include tools if we have functions enabled
+        tool_choice: 'auto' // Let AI decide when to call functions
       },
       (chunk) => {
         // Accumulate chunks for full response
@@ -251,6 +319,30 @@ export const chat = async (req, res) => {
         accumulatedText += chunk;
       }
     );
+    
+    // Check if AI called the end_call function
+    // Only process if end_call function was actually enabled and added to tools
+    if (tools.length > 0 && functionCalls && functionCalls.length > 0) {
+      for (const funcCall of functionCalls) {
+        if (funcCall.function.name === 'end_call') {
+          // Verify end_call function is actually enabled
+          const endCallFunc = functions.find(f => f.name === 'end_call' && f.enabled);
+          if (endCallFunc) {
+            shouldEndCall = true;
+            triggeredFunction = { name: 'end_call' };
+            try {
+              const args = JSON.parse(funcCall.function.arguments || '{}');
+              console.log(`🔚 AI called end_call function. Reason: ${args.reason || 'Not specified'}`);
+            } catch (e) {
+              console.log(`🔚 AI called end_call function`);
+            }
+            break;
+          } else {
+            console.log('⚠️ AI tried to call end_call but function is not enabled');
+          }
+        }
+      }
+    }
 
     // Add AI response to conversation
     conversation.messages.push({
@@ -258,8 +350,8 @@ export const chat = async (req, res) => {
       content: aiResponse
     });
     await conversation.save();
-
-    // Update call history with latest messages - find by conversation ID and user
+    
+    // Update call history with latest messages and cost - find by conversation ID and user
     const callRecord = await CallHistory.findOne({ 
       conversationId: conversationId,
       userId: req.userId,
@@ -275,12 +367,82 @@ export const chat = async (req, res) => {
           content: msg.content
         }));
       callRecord.messages = userMessages;
-      // Estimate cost (rough calculation - adjust based on your pricing)
-      callRecord.cost += (tokensUsed / 1000) * 0.03; // Approximate cost
+      
+      // Calculate cost based on model and tokens used
+      // Pricing per 1K tokens (as of 2024):
+      // GPT-4: $0.03 input, $0.06 output per 1K tokens
+      // GPT-4o: $0.005 input, $0.015 output per 1K tokens
+      // GPT-3.5-turbo: $0.0015 input, $0.002 output per 1K tokens
+      let costPer1K = 0.03; // Default for GPT-4
+      if (openaiModel.includes('gpt-4o')) {
+        costPer1K = 0.01; // Average of input/output for GPT-4o
+      } else if (openaiModel.includes('gpt-3.5')) {
+        costPer1K = 0.002; // Average for GPT-3.5
+      } else if (openaiModel.includes('gpt-4-turbo')) {
+        costPer1K = 0.01; // GPT-4 Turbo pricing
+      }
+      
+      const messageCost = (tokensUsed / 1000) * costPer1K;
+      callRecord.cost = (callRecord.cost || 0) + messageCost;
+      
+      console.log(`💰 Cost calculation: ${tokensUsed} tokens × $${costPer1K}/1K = $${messageCost.toFixed(6)}, Total: $${callRecord.cost.toFixed(6)}`);
+      
+      // If end_call function was triggered, mark call as ended
+      if (shouldEndCall && triggeredFunction) {
+        callRecord.status = 'ended';
+        callRecord.endTime = new Date();
+        callRecord.endReason = 'function_triggered';
+        const duration = Math.floor((callRecord.endTime - callRecord.startTime) / 1000);
+        callRecord.duration = duration;
+        console.log(`✅ Call ended by function: ${triggeredFunction.name}`);
+      }
+      
       await callRecord.save();
       console.log(`📝 Call history updated for ${callRecord._id}, total messages: ${callRecord.messages.length}`);
     } else {
       console.log(`⚠️ Warning: Call record not found for conversation ${conversationId}`);
+    }
+    
+    // If end_call function was triggered, return response with shouldEndCall flag (before generating audio)
+    if (shouldEndCall && triggeredFunction) {
+      // Still generate audio for the goodbye message
+      let audioUrl = null;
+      try {
+        const speechSettings = agent?.speechSettings || {};
+        const actualVoiceId = speechSettings.voiceId;
+        
+        console.log('🔊 Generating audio for end_call response:', {
+          voiceId: actualVoiceId || config.elevenlabs.voiceId,
+          voiceName: speechSettings.voiceName || 'Unknown',
+          modelId: speechSettings.modelId || config.elevenlabs.modelId,
+        });
+        
+        const audioFileId = await textToSpeech(aiResponse, {
+          voiceId: actualVoiceId,
+          modelId: speechSettings.modelId || config.elevenlabs.modelId,
+          stability: speechSettings.stability ?? 0.5,
+          similarity_boost: speechSettings.similarityBoost ?? 0.75,
+          type: 'conversation' // Will be saved as temporary segment
+        });
+        
+        // Track this audio segment in conversation for later merging
+        if (conversation && audioFileId) {
+          conversation.audioSegments = conversation.audioSegments || [];
+          conversation.audioSegments.push(audioFileId);
+          await conversation.save();
+        }
+        
+        audioUrl = `/api/audio/${audioFileId}`;
+      } catch (error) {
+        console.error('Error generating audio for end_call:', error);
+      }
+      
+      return res.json({
+        text: aiResponse,
+        audioUrl: audioUrl,
+        shouldEndCall: true,
+        functionTriggered: 'end_call'
+      });
     }
 
     // Convert to speech using ElevenLabs (generate audio for full response)
@@ -314,9 +476,18 @@ export const chat = async (req, res) => {
         voiceId: actualVoiceId || config.elevenlabs.voiceId,
         modelId: speechSettings.modelId || config.elevenlabs.modelId,
         stability: speechSettings.stability ?? 0.5,
-        similarity_boost: speechSettings.similarityBoost ?? 0.75
+        similarity_boost: speechSettings.similarityBoost ?? 0.75,
+        type: 'conversation' // Will be saved as temporary segment
       });
-      // Return URL to access the audio from GridFS
+      
+      // Track this audio segment in conversation for later merging
+      if (conversation && audioFileId) {
+        conversation.audioSegments = conversation.audioSegments || [];
+        conversation.audioSegments.push(audioFileId);
+        await conversation.save();
+      }
+      
+      // Return URL to access the audio from GridFS (temporary)
       audioUrl = `/api/audio/${audioFileId}`;
     } catch (ttsError) {
       console.error('Text-to-speech error:', ttsError);
@@ -379,8 +550,16 @@ export const getCuttingPhrase = async (req, res) => {
         voiceId: cuttingVoiceId,
         modelId: speechSettings.modelId || config.elevenlabs.modelId,
         stability: speechSettings.stability ?? 0.5,
-        similarity_boost: speechSettings.similarityBoost ?? 0.75
+        similarity_boost: speechSettings.similarityBoost ?? 0.75,
+        type: 'conversation' // Will be saved as temporary segment
       });
+      
+      // Track this audio segment in conversation for later merging
+      if (conversation && cuttingAudioFileId) {
+        conversation.audioSegments = conversation.audioSegments || [];
+        conversation.audioSegments.push(cuttingAudioFileId);
+        await conversation.save();
+      }
       // Return URL to access the audio from GridFS
       cuttingAudioUrl = `/api/audio/${cuttingAudioFileId}`;
     } catch (ttsError) {
@@ -470,6 +649,31 @@ export const endConversation = async (req, res) => {
           role: msg.role,
           content: msg.content
         }));
+      
+      // Merge all audio segments into one full conversation audio file
+      if (conversation.audioSegments && conversation.audioSegments.length > 0) {
+        try {
+          console.log(`🔗 Merging ${conversation.audioSegments.length} audio segments for conversation ${conversation._id}`);
+          const mergedAudioFileId = await mergeConversationAudio(
+            conversation.audioSegments,
+            conversation._id.toString()
+          );
+          
+          // Store the merged audio file ID in call history
+          callRecord.audioUrl = `/api/audio/${mergedAudioFileId}`;
+          console.log(`✅ Full conversation audio saved: ${mergedAudioFileId}`);
+          
+          // Delete temporary audio segments after merging
+          try {
+            await deleteTemporaryAudioSegments(conversation.audioSegments);
+          } catch (deleteError) {
+            console.error('⚠️ Error deleting temporary segments (non-critical):', deleteError);
+          }
+        } catch (mergeError) {
+          console.error('❌ Error merging conversation audio:', mergeError);
+          // Continue without audio if merge fails
+        }
+      }
     }
 
     await callRecord.save();

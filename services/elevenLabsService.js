@@ -1,7 +1,9 @@
 import axios from 'axios';
 import mongoose from 'mongoose';
 import { GridFSBucket } from 'mongodb';
+import crypto from 'crypto';
 import { config } from '../config/index.js';
+import { getCachedAudio, storeAudioWithMetadata } from './audioCacheService.js';
 
 // Ensure mongoose connection is ready
 const getDb = () => {
@@ -14,7 +16,7 @@ const getDb = () => {
 /**
  * Convert text to speech using ElevenLabs API and store in MongoDB GridFS
  * @param {string} text - Text to convert to speech
- * @param {Object} options - Optional voice settings
+ * @param {Object} options - Optional voice settings (voiceId, modelId, stability, similarity_boost, type, useCache)
  * @returns {Promise<string>} - MongoDB file ID as string
  */
 export async function textToSpeech(text, options = {}) {
@@ -43,6 +45,50 @@ export async function textToSpeech(text, options = {}) {
       stability: options.stability ?? 0.5,
       similarity_boost: options.similarity_boost ?? 0.75,
     };
+    
+    const audioType = options.type || 'conversation'; // 'preview', 'conversation', or 'temporary'
+    const useCache = options.useCache !== false && audioType === 'preview'; // Only cache previews by default
+
+    // For previews: Don't save to MongoDB, return audio buffer directly
+    if (audioType === 'preview') {
+      // Just return the audio buffer - don't save to GridFS
+      // The previewVoice controller will handle streaming
+      const response = await axios.post(
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+        {
+          text: text,
+          model_id: modelId,
+          voice_settings: voiceSettings,
+        },
+        {
+          headers: {
+            'Accept': 'audio/mpeg',
+            'Content-Type': 'application/json',
+            'xi-api-key': apiKey,
+          },
+          responseType: 'arraybuffer',
+        }
+      );
+      
+      // Return buffer directly for previews (not saved to MongoDB)
+      return Buffer.from(response.data);
+    }
+
+    // Check cache first for other types (if needed)
+    if (useCache) {
+      const cachedFileId = await getCachedAudio(
+        text, 
+        voiceId, 
+        options.modelId || config.elevenlabs.modelId,
+        voiceSettings.stability,
+        voiceSettings.similarity_boost
+      );
+      
+      if (cachedFileId) {
+        console.log('✅ Using cached audio, skipping ElevenLabs API call');
+        return cachedFileId;
+      }
+    }
 
     const apiUrl = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
     console.log('🔊 Calling ElevenLabs API:', apiUrl);
@@ -64,40 +110,30 @@ export async function textToSpeech(text, options = {}) {
       }
     );
 
-    // Store audio in MongoDB GridFS
+    // Store audio in MongoDB GridFS with metadata (only for conversation/temporary types)
     try {
-      const db = getDb();
-      if (!db) {
-        throw new Error('Database connection not available');
-      }
-      
-      const bucket = new GridFSBucket(db, { bucketName: 'audio' });
-      const audioFileName = `audio_${Date.now()}.mp3`;
-      
       // Convert arraybuffer to Buffer
       const audioBuffer = Buffer.from(response.data);
       console.log(`📦 Audio buffer size: ${audioBuffer.length} bytes`);
       
-      return new Promise((resolve, reject) => {
-        const uploadStream = bucket.openUploadStream(audioFileName, {
-          contentType: 'audio/mpeg',
-        });
-
-        uploadStream.on('finish', () => {
-          const fileId = uploadStream.id.toString();
-          console.log('✅ Audio stored in MongoDB GridFS with fileId:', fileId);
-          resolve(fileId);
-        });
-
-        uploadStream.on('error', (error) => {
-          console.error('❌ Error uploading to GridFS:', error);
-          console.error('❌ Error stack:', error.stack);
-          reject(error);
-        });
-
-        // Write the buffer and end the stream
-        uploadStream.end(audioBuffer);
+      // For temporary conversation segments, mark as temporary (will be merged later)
+      const actualType = audioType === 'conversation' ? 'temporary' : audioType;
+      
+      // Generate cache key for previews (not used for temporary)
+      const cacheKey = useCache ? crypto.createHash('md5')
+        .update(`${text}|${voiceId}|${options.modelId || config.elevenlabs.modelId}|${voiceSettings.stability}|${voiceSettings.similarity_boost}`)
+        .digest('hex') : null;
+      
+      // Store with metadata
+      const fileId = await storeAudioWithMetadata(audioBuffer, {
+        type: actualType,
+        cacheKey: cacheKey,
+        voiceId: voiceId,
+        modelId: options.modelId || config.elevenlabs.modelId,
+        textLength: text.length
       });
+      
+      return fileId;
     } catch (gridfsError) {
       console.error('❌ GridFS upload failed, falling back to local storage:', gridfsError);
       // Fallback to local file storage if GridFS fails

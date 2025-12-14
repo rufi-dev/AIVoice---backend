@@ -39,6 +39,11 @@ const conversationSchema = new mongoose.Schema({
   startTime: {
     type: Date,
     default: Date.now
+  },
+  // Temporary storage for audio file IDs during conversation (will be merged on end)
+  audioSegments: {
+    type: [String], // GridFS file IDs
+    default: []
   }
 }, {
   timestamps: true

@@ -60,7 +60,28 @@ const agentSchema = new mongoose.Schema({
   callSettings: {
     aiSpeaksFirst: Boolean,
     pauseBeforeSpeaking: Number
-  }
+  },
+  functions: [{
+    name: {
+      type: String,
+      required: true
+    },
+    description: {
+      type: String,
+      default: ''
+    },
+    enabled: {
+      type: Boolean,
+      default: true
+    },
+    triggers: [{
+      type: String // Keywords/phrases that trigger this function (e.g., "bye", "goodbye", "end call")
+    }],
+    config: {
+      type: mongoose.Schema.Types.Mixed, // Flexible config for function-specific settings
+      default: {}
+    }
+  }]
 }, {
   timestamps: true
 });

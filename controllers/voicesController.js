@@ -1,4 +1,5 @@
 import Voice from '../models/Voice.js';
+import { textToSpeech } from '../services/elevenLabsService.js';
 
 export const getAllVoices = async (req, res) => {
   try {
@@ -292,3 +293,73 @@ export const getPredefinedVoices = async (req, res) => {
   }
 };
 
+// Preview voice - generate a short sample message for each voice
+export const previewVoice = async (req, res) => {
+  try {
+    const { voiceId, voiceName } = req.body;
+    
+    console.log('🎵 Preview voice request:', { voiceId, voiceName, body: req.body });
+    
+    if (!voiceId) {
+      console.error('❌ Voice ID missing in request');
+      return res.status(400).json({ error: 'Voice ID is required', details: 'voiceId parameter is missing' });
+    }
+
+    // Different preview messages for each voice
+    const previewMessages = {
+      'Roger': 'Hello, this is Roger speaking. I\'m here to help you today.',
+      'Sarah': 'Hi there! This is Sarah. How can I assist you?',
+      'Laura': 'Hello! I\'m Laura, and I\'m ready to help.',
+      'Charlie': 'Hey! Charlie here. What can I do for you?',
+      'George': 'Good day! This is George. How may I help you?',
+      'Callum': 'Hello! Callum speaking. How can I assist you today?',
+      'River': 'Hi! I\'m River. What can I help you with?',
+      'Harry': 'Hello there! This is Harry. How may I be of service?',
+      'Liam': 'Hey! Liam here. What can I do for you?',
+      'Alice': 'Hello! I\'m Alice. How can I help you today?',
+      'Matilda': 'Hi there! This is Matilda. What can I assist you with?',
+      'Will': 'Hello! Will speaking. How can I help you?'
+    };
+
+    // Get preview message for this voice, or use default
+    const previewText = previewMessages[voiceName] || `Hello! This is ${voiceName || 'my voice'}. How can I help you?`;
+
+    console.log(`🎵 Generating voice preview for ${voiceName} (${voiceId}): "${previewText}"`);
+
+    // Generate audio using ElevenLabs (preview - don't save to MongoDB)
+    let audioBuffer;
+    try {
+      audioBuffer = await textToSpeech(previewText, {
+        voiceId: voiceId,
+        modelId: 'eleven_turbo_v2',
+        stability: 0.5,
+        similarity_boost: 0.75,
+        type: 'preview' // This returns buffer directly, not saved to MongoDB
+      });
+      console.log(`✅ Audio generated successfully. Size: ${audioBuffer.length} bytes`);
+    } catch (ttsError) {
+      console.error('❌ Text-to-speech error:', ttsError);
+      throw new Error(`Failed to generate audio: ${ttsError.message}`);
+    }
+
+    if (!audioBuffer || !Buffer.isBuffer(audioBuffer)) {
+      throw new Error('Audio buffer is missing or invalid');
+    }
+
+    // Stream audio directly to client (no MongoDB storage)
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', audioBuffer.length);
+    res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache for 1 hour
+    res.send(audioBuffer);
+    
+    console.log(`✅ Streamed preview audio directly (${audioBuffer.length} bytes)`);
+  } catch (error) {
+    console.error('❌ Error previewing voice:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Failed to preview voice', 
+      details: error.message || 'Unknown error occurred',
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+};

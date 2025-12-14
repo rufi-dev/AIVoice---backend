@@ -7,6 +7,7 @@ import callHistoryRoutes from './callHistory.js';
 import voicesRoutes from './voices.js';
 import { authenticate } from '../middleware/auth.js';
 import { serveAudioFromGridFS } from '../controllers/audioController.js';
+import { getStorageStats, cleanupAudio } from '../controllers/audioManagementController.js';
 
 const router = express.Router();
 
@@ -27,6 +28,8 @@ router.use('/knowledge-bases', authenticate, knowledgeBasesRoutes);
 router.use('/conversation', authenticate, conversationsRoutes);
 router.use('/call-history', authenticate, callHistoryRoutes);
 router.use('/voices', authenticate, voicesRoutes);
+router.get('/audio-stats', authenticate, getStorageStats);
+router.post('/audio-cleanup', authenticate, cleanupAudio);
 
 export default router;
 

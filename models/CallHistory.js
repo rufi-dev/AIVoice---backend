@@ -69,6 +69,10 @@ const callHistorySchema = new mongoose.Schema({
   summary: {
     type: String,
     default: null
+  },
+  audioUrl: {
+    type: String,
+    default: null // Full conversation audio file ID in GridFS
   }
 }, {
   timestamps: true

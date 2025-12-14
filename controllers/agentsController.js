@@ -72,7 +72,7 @@ export const createAgent = async (req, res) => {
 
 export const updateAgent = async (req, res) => {
   try {
-    const { systemPrompt, knowledgeBaseId, speechSettings, callSettings } = req.body;
+    const { systemPrompt, knowledgeBaseId, speechSettings, callSettings, functions } = req.body;
     
     console.log('💾 Updating agent with speechSettings:', {
       voiceId: speechSettings?.voiceId,
@@ -95,6 +95,7 @@ export const updateAgent = async (req, res) => {
       console.log('💾 Saving speechSettings with voiceId:', updateData.speechSettings.voiceId);
     }
     if (callSettings !== undefined) updateData.callSettings = callSettings;
+    if (functions !== undefined) updateData.functions = functions;
 
     const agent = await Agent.findOneAndUpdate(
       { _id: req.params.id, userId: req.userId },
