@@ -1,0 +1,32 @@
+{
+  "name": "aivoice-backend",
+  "version": "1.0.0",
+  "description": "Voice Agent Backend with OpenAI and ElevenLabs",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "voice",
+    "ai",
+    "openai",
+    "elevenlabs"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.2",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.3",
+    "mammoth": "^1.6.0",
+    "mongoose": "^8.0.3",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.20.1",
+    "pdf-parse": "^1.1.1"
+  }
+}

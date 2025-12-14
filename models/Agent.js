@@ -1,0 +1,68 @@
+import mongoose from 'mongoose';
+
+const agentSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+    index: true
+  },
+  name: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  systemPrompt: {
+    type: String,
+    default: ''
+  },
+  knowledgeBaseId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'KnowledgeBase',
+    default: null
+  },
+  speechSettings: {
+    voiceId: {
+      type: String,
+      default: '21m00Tcm4TlvDq8ikWAM'
+    },
+    voiceName: String,
+    voiceProvider: {
+      type: String,
+      enum: ['elevenlabs', 'openai', 'custom'],
+      default: 'elevenlabs'
+    },
+    modelId: {
+      type: String,
+      default: 'eleven_turbo_v2'
+    },
+    openaiModel: {
+      type: String,
+      default: 'gpt-4'
+    },
+    language: {
+      type: String,
+      default: 'en'
+    },
+    stability: {
+      type: Number,
+      default: 0.5,
+      min: 0,
+      max: 1
+    },
+    similarityBoost: {
+      type: Number,
+      default: 0.75,
+      min: 0,
+      max: 1
+    }
+  },
+  callSettings: {
+    aiSpeaksFirst: Boolean,
+    pauseBeforeSpeaking: Number
+  }
+}, {
+  timestamps: true
+});
+
+export default mongoose.model('Agent', agentSchema);

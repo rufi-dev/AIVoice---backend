@@ -1,0 +1,32 @@
+import express from 'express';
+import authRoutes from './auth.js';
+import agentsRoutes from './agents.js';
+import knowledgeBasesRoutes from './knowledgeBases.js';
+import conversationsRoutes from './conversations.js';
+import callHistoryRoutes from './callHistory.js';
+import voicesRoutes from './voices.js';
+import { authenticate } from '../middleware/auth.js';
+import { serveAudioFromGridFS } from '../controllers/audioController.js';
+
+const router = express.Router();
+
+// Health check endpoint (public)
+router.get('/health', (req, res) => {
+  res.json({ status: 'ok', message: 'Voice Agent API is running' });
+});
+
+// Audio serving route (public - file IDs are hard to guess, providing security through obscurity)
+router.get('/audio/:fileId', serveAudioFromGridFS);
+
+// Auth routes (public)
+router.use('/auth', authRoutes);
+
+// Protected API routes - require authentication
+router.use('/agents', authenticate, agentsRoutes);
+router.use('/knowledge-bases', authenticate, knowledgeBasesRoutes);
+router.use('/conversation', authenticate, conversationsRoutes);
+router.use('/call-history', authenticate, callHistoryRoutes);
+router.use('/voices', authenticate, voicesRoutes);
+
+export default router;
+

@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: aivoice-backend
+    env: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Render automatically sets PORT, no need to set it here
+      # Add these environment variables in Render dashboard:
+      # - MONGODB_URI (required)
+      # - OPENAI_API_KEY (required)
+      # - ELEVENLABS_API_KEY (required)
+      # - ELEVENLABS_VOICE_ID (optional, defaults to 21m00Tcm4TlvDq8ikWAM)
+      # - ELEVENLABS_MODEL_ID (optional, defaults to eleven_turbo_v2)
+      # - JWT_SECRET (required)
+      # - JWT_EXPIRES_IN (optional, defaults to 7d)
