@@ -84,8 +84,6 @@ const agentSchema = new mongoose.Schema({
   }],
   shareableToken: {
     type: String,
-    unique: true,
-    sparse: true, // Allow null values but ensure uniqueness when present
     default: null
   },
   isPublic: {
@@ -95,5 +93,14 @@ const agentSchema = new mongoose.Schema({
 }, {
   timestamps: true
 });
+
+// Ensure shareableToken is unique only when present (ignore null/undefined)
+agentSchema.index(
+  { shareableToken: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { shareableToken: { $type: 'string' } }
+  }
+);
 
 export default mongoose.model('Agent', agentSchema);
