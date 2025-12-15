@@ -8,6 +8,7 @@ import voicesRoutes from './voices.js';
 import { authenticate } from '../middleware/auth.js';
 import { serveAudioFromGridFS } from '../controllers/audioController.js';
 import { getStorageStats, cleanupAudio } from '../controllers/audioManagementController.js';
+import { getAgentByToken } from '../controllers/publicAgentController.js';
 
 const router = express.Router();
 
@@ -18,6 +19,9 @@ router.get('/health', (req, res) => {
 
 // Audio serving route (public - file IDs are hard to guess, providing security through obscurity)
 router.get('/audio/:fileId', serveAudioFromGridFS);
+
+// Public agent route (no authentication required)
+router.get('/public/agent/:token', getAgentByToken);
 
 // Auth routes (public)
 router.use('/auth', authRoutes);

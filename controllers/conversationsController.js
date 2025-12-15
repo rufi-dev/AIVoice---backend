@@ -14,14 +14,27 @@ import { mergeConversationAudio, deleteTemporaryAudioSegments } from '../service
  */
 export const startConversation = async (req, res) => {
   try {
-    const { systemPrompt, conversationId, agentId, knowledgeBaseId, aiSpeaksFirst } = req.body;
+    const { systemPrompt, conversationId, agentId, knowledgeBaseId, aiSpeaksFirst, publicToken } = req.body;
     
-    // Get agent to retrieve language setting and verify ownership
+    // Get agent to retrieve language setting and verify ownership or public access
     let agent = null;
     if (agentId) {
-      agent = await Agent.findOne({ _id: agentId, userId: req.userId });
-      if (!agent) {
-        return res.status(404).json({ error: 'Agent not found or access denied' });
+      // If publicToken is provided, allow public access
+      if (publicToken) {
+        agent = await Agent.findOne({ 
+          _id: agentId, 
+          shareableToken: publicToken,
+          isPublic: true 
+        });
+        if (!agent) {
+          return res.status(404).json({ error: 'Agent not found or not publicly accessible' });
+        }
+      } else {
+        // Regular authenticated access
+        agent = await Agent.findOne({ _id: agentId, userId: req.userId });
+        if (!agent) {
+          return res.status(404).json({ error: 'Agent not found or access denied' });
+        }
       }
     }
     
@@ -36,17 +49,20 @@ export const startConversation = async (req, res) => {
 
     const startTime = new Date();
 
-    // Verify knowledge base belongs to user if knowledgeBaseId is provided
-    if (knowledgeBaseId) {
+    // Verify knowledge base belongs to user if knowledgeBaseId is provided (skip for public access)
+    if (knowledgeBaseId && !publicToken) {
       const kb = await KnowledgeBase.findOne({ _id: knowledgeBaseId, userId: req.userId });
       if (!kb) {
         return res.status(404).json({ error: 'Knowledge base not found or access denied' });
       }
     }
 
+    // For public agents, userId might not be available - use agent owner's userId or null
+    const userId = publicToken ? (agent?.userId || null) : req.userId;
+    
     // Initialize conversation with system message
     const conversation = new Conversation({
-      userId: req.userId,
+      userId: userId,
       systemPrompt: finalSystemPrompt,
       agentId: agentId || null,
       knowledgeBaseId: knowledgeBaseId || null,
@@ -60,17 +76,22 @@ export const startConversation = async (req, res) => {
     });
     await conversation.save();
 
-    // Create call history entry (agent already fetched above)
-    const callRecord = new CallHistory({
-      userId: req.userId,
-      conversationId: conversation._id,
-      agentId: agentId || null,
-      agentName: agent ? agent.name : 'Unknown',
-      startTime: startTime,
-      status: 'active'
-    });
-    await callRecord.save();
-    console.log(`✅ Call history created: ${callRecord._id} for agent: ${callRecord.agentName}`);
+    // Create call history entry (only for authenticated users, skip for public)
+    let callRecord = null;
+    if (!publicToken && userId) {
+      callRecord = new CallHistory({
+        userId: userId,
+        conversationId: conversation._id,
+        agentId: agentId || null,
+        agentName: agent ? agent.name : 'Unknown',
+        startTime: startTime,
+        status: 'active'
+      });
+      await callRecord.save();
+      console.log(`✅ Call history created: ${callRecord._id} for agent: ${callRecord.agentName}`);
+    } else if (publicToken) {
+      console.log(`✅ Public conversation started (no call history for public access)`);
+    }
 
     // If AI should speak first, generate an initial greeting
     let initialGreeting = null;
@@ -188,19 +209,40 @@ export const startConversation = async (req, res) => {
  */
 export const chat = async (req, res) => {
   try {
-    const { message, conversationId, agentId } = req.body;
+    const { message, conversationId, agentId, publicToken } = req.body;
 
     if (!message || !conversationId) {
       return res.status(400).json({ error: 'Message and conversationId are required' });
     }
 
-    const conversation = await Conversation.findOne({ _id: conversationId, userId: req.userId });
-    if (!conversation) {
-      return res.status(404).json({ error: 'Conversation not found' });
+    // Find conversation and verify ownership or public access
+    let conversation;
+    if (publicToken) {
+      // Public access - verify conversation belongs to a public agent
+      conversation = await Conversation.findOne({ _id: conversationId });
+      if (!conversation) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+    } else {
+      conversation = await Conversation.findOne({ _id: conversationId, userId: req.userId });
+      if (!conversation) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
     }
 
     // Get agent first to check functions and get settings
-    const agent = agentId ? await Agent.findOne({ _id: agentId, userId: req.userId }) : null;
+    let agent = null;
+    if (conversation.agentId) {
+      if (publicToken) {
+        agent = await Agent.findOne({ 
+          _id: conversation.agentId,
+          shareableToken: publicToken,
+          isPublic: true 
+        });
+      } else {
+        agent = await Agent.findOne({ _id: conversation.agentId, userId: req.userId });
+      }
+    }
     const speechSettings = agent?.speechSettings || {};
     const openaiModel = speechSettings.openaiModel || 'gpt-4';
     const language = speechSettings.language || 'en';
@@ -351,12 +393,13 @@ export const chat = async (req, res) => {
     });
     await conversation.save();
     
-    // Update call history with latest messages and cost - find by conversation ID and user
-    const callRecord = await CallHistory.findOne({ 
+    // Update call history with latest messages and cost (only for authenticated users)
+    const userId = publicToken ? (conversation.userId || null) : req.userId;
+    const callRecord = userId ? await CallHistory.findOne({ 
       conversationId: conversationId,
-      userId: req.userId,
+      userId: userId,
       status: 'active'
-    });
+    }) : null;
     
     if (callRecord) {
       // Update messages (excluding system message for cleaner history)
@@ -616,17 +659,39 @@ export const deleteConversation = async (req, res) => {
  */
 export const endConversation = async (req, res) => {
   try {
-    const conversation = await Conversation.findOne({ _id: req.params.id, userId: req.userId });
+    const { publicToken } = req.body;
+    
+    // Find conversation and verify ownership or public access
+    let conversation;
+    if (publicToken) {
+      conversation = await Conversation.findOne({ _id: req.params.id });
+      if (conversation && conversation.agentId) {
+        const agent = await Agent.findOne({ 
+          _id: conversation.agentId,
+          shareableToken: publicToken,
+          isPublic: true 
+        });
+        if (!agent) {
+          return res.status(404).json({ error: 'Conversation not found or not publicly accessible' });
+        }
+      } else {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+    } else {
+      conversation = await Conversation.findOne({ _id: req.params.id, userId: req.userId });
+    }
+    
     if (!conversation) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
     
-    // Find call history by conversation ID and user
-    const callRecord = await CallHistory.findOne({ 
+    // Find call history by conversation ID and user (only for authenticated users)
+    const userId = publicToken ? (conversation.userId || null) : req.userId;
+    const callRecord = userId ? await CallHistory.findOne({ 
       conversationId: req.params.id,
-      userId: req.userId,
+      userId: userId,
       status: 'active'
-    });
+    }) : null;
     
     if (!callRecord) {
       return res.status(404).json({ error: 'Call not found' });

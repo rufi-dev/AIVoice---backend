@@ -81,7 +81,17 @@ const agentSchema = new mongoose.Schema({
       type: mongoose.Schema.Types.Mixed, // Flexible config for function-specific settings
       default: {}
     }
-  }]
+  }],
+  shareableToken: {
+    type: String,
+    unique: true,
+    sparse: true, // Allow null values but ensure uniqueness when present
+    default: null
+  },
+  isPublic: {
+    type: Boolean,
+    default: false // Whether agent is publicly accessible via shareable link
+  }
 }, {
   timestamps: true
 });

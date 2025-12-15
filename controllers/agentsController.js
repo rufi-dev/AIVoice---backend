@@ -1,4 +1,5 @@
 import Agent from '../models/Agent.js';
+import { generateShareableToken } from './publicAgentController.js';
 
 export const getAllAgents = async (req, res) => {
   try {
@@ -72,7 +73,7 @@ export const createAgent = async (req, res) => {
 
 export const updateAgent = async (req, res) => {
   try {
-    const { systemPrompt, knowledgeBaseId, speechSettings, callSettings, functions } = req.body;
+    const { systemPrompt, knowledgeBaseId, speechSettings, callSettings, functions, isPublic } = req.body;
     
     console.log('💾 Updating agent with speechSettings:', {
       voiceId: speechSettings?.voiceId,
@@ -96,6 +97,16 @@ export const updateAgent = async (req, res) => {
     }
     if (callSettings !== undefined) updateData.callSettings = callSettings;
     if (functions !== undefined) updateData.functions = functions;
+    if (isPublic !== undefined) {
+      updateData.isPublic = isPublic;
+      // Generate token if making public and token doesn't exist
+      if (isPublic) {
+        const existingAgent = await Agent.findOne({ _id: req.params.id, userId: req.userId });
+        if (existingAgent && !existingAgent.shareableToken) {
+          updateData.shareableToken = generateShareableToken();
+        }
+      }
+    }
 
     const agent = await Agent.findOneAndUpdate(
       { _id: req.params.id, userId: req.userId },
@@ -135,6 +146,35 @@ export const deleteAgent = async (req, res) => {
   } catch (error) {
     console.error('Error deleting agent:', error);
     res.status(500).json({ error: 'Failed to delete agent' });
+  }
+};
+
+/**
+ * Generate or regenerate shareable token for an agent
+ */
+export const generateToken = async (req, res) => {
+  try {
+    const agent = await Agent.findOne({ _id: req.params.id, userId: req.userId });
+    if (!agent) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    const newToken = generateShareableToken();
+    agent.shareableToken = newToken;
+    agent.isPublic = true; // Automatically make public when token is generated
+    await agent.save();
+
+    const agentObj = agent.toObject();
+    const agentWithId = {
+      ...agentObj,
+      id: agent._id.toString(),
+      knowledgeBaseId: agentObj.knowledgeBaseId ? agentObj.knowledgeBaseId.toString() : null
+    };
+
+    res.json(agentWithId);
+  } catch (error) {
+    console.error('Error generating token:', error);
+    res.status(500).json({ error: 'Failed to generate token' });
   }
 };
 

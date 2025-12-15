@@ -12,6 +12,7 @@ const router = express.Router();
 
 router.post('/start', startConversation);
 router.post('/chat', chat);
+router.post('/:id/chat', chat); // Also support /conversation/:id/chat
 router.post('/cutting-phrase', getCuttingPhrase);
 router.get('/:id', getConversation);
 router.delete('/:id', deleteConversation);
