@@ -105,6 +105,9 @@ export const updateAgent = async (req, res) => {
         if (existingAgent && !existingAgent.shareableToken) {
           updateData.shareableToken = generateShareableToken();
         }
+      } else {
+        // Clear token when making agent private
+        updateData.shareableToken = null;
       }
     }
 
