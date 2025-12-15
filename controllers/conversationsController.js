@@ -48,7 +48,7 @@ export const startConversation = async (req, res) => {
     }
 
     const startTime = new Date();
-
+    
     // Verify knowledge base belongs to user if knowledgeBaseId is provided (skip for public access)
     if (knowledgeBaseId && !publicToken) {
       const kb = await KnowledgeBase.findOne({ _id: knowledgeBaseId, userId: req.userId });
@@ -59,7 +59,7 @@ export const startConversation = async (req, res) => {
 
     // For public agents, userId might not be available - use agent owner's userId or null
     const userId = publicToken ? (agent?.userId || null) : req.userId;
-    
+
     // Initialize conversation with system message
     const conversation = new Conversation({
       userId: userId,
@@ -81,14 +81,14 @@ export const startConversation = async (req, res) => {
     if (!publicToken && userId) {
       callRecord = new CallHistory({
         userId: userId,
-        conversationId: conversation._id,
-        agentId: agentId || null,
-        agentName: agent ? agent.name : 'Unknown',
-        startTime: startTime,
-        status: 'active'
-      });
-      await callRecord.save();
-      console.log(`✅ Call history created: ${callRecord._id} for agent: ${callRecord.agentName}`);
+      conversationId: conversation._id,
+      agentId: agentId || null,
+      agentName: agent ? agent.name : 'Unknown',
+      startTime: startTime,
+      status: 'active'
+    });
+    await callRecord.save();
+    console.log(`✅ Call history created: ${callRecord._id} for agent: ${callRecord.agentName}`);
     } else if (publicToken) {
       console.log(`✅ Public conversation started (no call history for public access)`);
     }
@@ -225,8 +225,8 @@ export const chat = async (req, res) => {
       }
     } else {
       conversation = await Conversation.findOne({ _id: conversationId, userId: req.userId });
-      if (!conversation) {
-        return res.status(404).json({ error: 'Conversation not found' });
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found' });
       }
     }
 
@@ -308,11 +308,11 @@ export const chat = async (req, res) => {
         };
       }
       return {
-        role: msg.role,
-        content: msg.content
+      role: msg.role,
+      content: msg.content
       };
     });
-    
+
     // Update system prompt with language if conversation doesn't have it yet
     // This ensures language is applied to all responses
     if (conversation.messages.length > 0 && conversation.messages[0].role === 'system') {
@@ -349,8 +349,8 @@ export const chat = async (req, res) => {
     const { content: aiResponse, tokensUsed, functionCalls } = await getStreamingAIResponse(
       messagesForOpenAI,
       {
-        model: openaiModel,
-        temperature: 0.7,
+      model: openaiModel,
+      temperature: 0.7,
         max_tokens: 500,
         tools: tools.length > 0 ? tools : undefined, // Only include tools if we have functions enabled
         tool_choice: 'auto' // Let AI decide when to call functions
@@ -392,7 +392,7 @@ export const chat = async (req, res) => {
       content: aiResponse
     });
     await conversation.save();
-    
+
     // Update call history with latest messages and cost (only for authenticated users)
     const userId = publicToken ? (conversation.userId || null) : req.userId;
     const callRecord = userId ? await CallHistory.findOne({ 
@@ -445,7 +445,7 @@ export const chat = async (req, res) => {
     } else {
       console.log(`⚠️ Warning: Call record not found for conversation ${conversationId}`);
     }
-    
+
     // If end_call function was triggered, return response with shouldEndCall flag (before generating audio)
     if (shouldEndCall && triggeredFunction) {
       // Still generate audio for the goodbye message
