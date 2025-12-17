@@ -73,6 +73,35 @@ const callHistorySchema = new mongoose.Schema({
   audioUrl: {
     type: String,
     default: null // Full conversation audio file ID in GridFS
+  },
+  latencyTurns: {
+    type: [
+      {
+        userText: { type: String, default: '' },
+        mode: { type: String, default: 'chunked_tts' },
+        asrFinalMs: { type: Number, default: null },
+        llmFirstTokenMs: { type: Number, default: null },
+        llmTotalMs: { type: Number, default: null },
+        ttsFirstAudioMs: { type: Number, default: null },
+        ttsTotalMs: { type: Number, default: null },
+        e2eFirstAudioMs: { type: Number, default: null },
+        createdAt: { type: Date, default: Date.now }
+      }
+    ],
+    default: []
+  },
+  latencySummary: {
+    avgE2eFirstAudioMs: { type: Number, default: null },
+    avgLlmFirstTokenMs: { type: Number, default: null },
+    avgTtsFirstAudioMs: { type: Number, default: null },
+    lastTurn: {
+      asrFinalMs: { type: Number, default: null },
+      llmFirstTokenMs: { type: Number, default: null },
+      llmTotalMs: { type: Number, default: null },
+      ttsFirstAudioMs: { type: Number, default: null },
+      ttsTotalMs: { type: Number, default: null },
+      e2eFirstAudioMs: { type: Number, default: null }
+    }
   }
 }, {
   timestamps: true

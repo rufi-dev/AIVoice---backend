@@ -45,13 +45,14 @@ export async function getStreamingAIResponse(messages, options = {}, onChunk) {
     model = 'gpt-4',
     tools = null, // OpenAI function definitions
     tool_choice = 'auto', // 'auto', 'none', or specific function
+    signal = undefined, // AbortSignal support for streaming cancellation
   } = options;
 
   let fullContent = '';
   let tokensUsed = 0;
   let functionCalls = []; // Track function calls from AI
 
-  const requestOptions = {
+  const requestBody = {
     model,
     messages,
     temperature,
@@ -62,11 +63,16 @@ export async function getStreamingAIResponse(messages, options = {}, onChunk) {
 
   // Add tools if provided (for function calling)
   if (tools && tools.length > 0) {
-    requestOptions.tools = tools;
-    requestOptions.tool_choice = tool_choice;
+    requestBody.tools = tools;
+    requestBody.tool_choice = tool_choice;
   }
 
-  const stream = await openai.chat.completions.create(requestOptions);
+  // IMPORTANT: AbortSignal must be passed as request option (2nd arg),
+  // not inside the JSON body (or OpenAI API will reject `signal`).
+  const stream = await openai.chat.completions.create(
+    requestBody,
+    signal ? { signal } : undefined
+  );
 
   for await (const chunk of stream) {
     const content = chunk.choices[0]?.delta?.content || '';

@@ -386,10 +386,19 @@ export const chat = async (req, res) => {
       }
     }
 
+    // OpenAI can legally return a tool call with no assistant content.
+    // Our Conversation model requires `content`, so ensure we always persist non-empty text.
+    let finalAiResponse = (aiResponse || '').trim();
+    if (!finalAiResponse) {
+      finalAiResponse = shouldEndCall
+        ? "Goodbye! Have a great day."
+        : "Sorry — I didn't catch that. Could you repeat?";
+    }
+
     // Add AI response to conversation
     conversation.messages.push({
       role: 'assistant',
-      content: aiResponse
+      content: finalAiResponse
     });
     await conversation.save();
 
@@ -460,7 +469,7 @@ export const chat = async (req, res) => {
           modelId: speechSettings.modelId || config.elevenlabs.modelId,
         });
         
-        const audioFileId = await textToSpeech(aiResponse, {
+        const audioFileId = await textToSpeech(finalAiResponse, {
           voiceId: actualVoiceId,
           modelId: speechSettings.modelId || config.elevenlabs.modelId,
           stability: speechSettings.stability ?? 0.5,
@@ -481,7 +490,7 @@ export const chat = async (req, res) => {
       }
       
       return res.json({
-        text: aiResponse,
+        text: finalAiResponse,
         audioUrl: audioUrl,
         shouldEndCall: true,
         functionTriggered: 'end_call'
@@ -515,7 +524,7 @@ export const chat = async (req, res) => {
         console.log('✅ Using custom voice:', actualVoiceId, speechSettings.voiceName);
       }
       
-      const audioFileId = await textToSpeech(aiResponse, {
+      const audioFileId = await textToSpeech(finalAiResponse, {
         voiceId: actualVoiceId || config.elevenlabs.voiceId,
         modelId: speechSettings.modelId || config.elevenlabs.modelId,
         stability: speechSettings.stability ?? 0.5,
@@ -538,13 +547,610 @@ export const chat = async (req, res) => {
     }
 
     res.json({
-      text: aiResponse,
+      text: finalAiResponse,
       audioUrl: audioUrl,
       tokensUsed: tokensUsed
     });
   } catch (error) {
     console.error('Error in chat:', error);
     res.status(500).json({ error: error.message || 'Failed to process chat request' });
+  }
+};
+
+/**
+ * Prefetch a draft assistant response while user is still speaking.
+ * Streams NDJSON events:
+ * - { type: 'assistant_delta', delta }
+ * - { type: 'latency', latency }
+ * - { type: 'done' }
+ *
+ * NOTE: This does NOT persist messages to MongoDB (speculative).
+ */
+export const prefetchDraft = async (req, res) => {
+  const startedAt = Date.now();
+  let firstTokenAt = null;
+
+  // NDJSON streaming
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  // Hint for proxies (nginx) not to buffer streaming responses
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const write = (obj) => {
+    try {
+      res.write(`${JSON.stringify(obj)}\n`);
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  const abortController = new AbortController();
+  req.on('close', () => {
+    try {
+      abortController.abort();
+    } catch (e) {}
+  });
+
+  try {
+    const { conversationId, draftText, publicToken } = req.body;
+
+    if (!conversationId || !draftText) {
+      write({ type: 'error', error: 'conversationId and draftText are required' });
+      return res.end();
+    }
+
+    // Find conversation and verify ownership or public access
+    let conversation;
+    if (publicToken) {
+      conversation = await Conversation.findOne({ _id: conversationId });
+      if (!conversation) {
+        write({ type: 'error', error: 'Conversation not found' });
+        return res.end();
+      }
+    } else {
+      conversation = await Conversation.findOne({ _id: conversationId, userId: req.userId });
+      if (!conversation) {
+        write({ type: 'error', error: 'Conversation not found' });
+        return res.end();
+      }
+    }
+
+    // Load agent settings
+    let agent = null;
+    if (conversation.agentId) {
+      if (publicToken) {
+        agent = await Agent.findOne({
+          _id: conversation.agentId,
+          shareableToken: publicToken,
+          isPublic: true
+        });
+      } else {
+        agent = await Agent.findOne({ _id: conversation.agentId, userId: req.userId });
+      }
+    }
+    const speechSettings = agent?.speechSettings || {};
+    // IMPORTANT: Prefetch can easily hit OpenAI TPM limits if it uses GPT-4.
+    // Use a fast/cheap model for speculative draft.
+    const openaiModel = 'gpt-4o-mini';
+    const language = speechSettings.language || 'en';
+
+    // Build messages (speculative last user message)
+    const messagesForOpenAI = (conversation.messages || []).map((msg) => ({
+      role: msg.role,
+      content: msg.content
+    }));
+
+    // Ensure language instruction is present (same logic as chat, but do not persist)
+    if (messagesForOpenAI.length > 0 && messagesForOpenAI[0].role === 'system') {
+      const systemMessage = messagesForOpenAI[0].content || '';
+      if (!systemMessage.includes(`MUST respond in`) && !systemMessage.includes(`respond in ${language}`)) {
+        const languageMap = {
+          en: 'English',
+          es: 'Spanish',
+          fr: 'French',
+          de: 'German',
+          it: 'Italian',
+          pt: 'Portuguese',
+          zh: 'Chinese',
+          ja: 'Japanese',
+          ko: 'Korean',
+          ru: 'Russian',
+          ar: 'Arabic',
+          hi: 'Hindi'
+        };
+        const languageName = languageMap[language] || 'English';
+        messagesForOpenAI[0].content = `${systemMessage}\n\nIMPORTANT: You MUST respond in ${languageName} (${language}). All your responses should be in ${languageName} language.`;
+      }
+    }
+
+    messagesForOpenAI.push({
+      role: 'user',
+      content: `Partial speech (may change): ${String(draftText).trim()}`
+    });
+
+    await getStreamingAIResponse(
+      messagesForOpenAI,
+      {
+        model: openaiModel,
+        temperature: 0.7,
+        max_tokens: 80,
+        signal: abortController.signal
+      },
+      (delta) => {
+        if (!firstTokenAt) firstTokenAt = Date.now();
+        write({ type: 'assistant_delta', delta });
+      }
+    );
+
+    write({
+      type: 'latency',
+      latency: {
+        llmFirstTokenMs: firstTokenAt ? firstTokenAt - startedAt : null,
+        llmTotalMs: Date.now() - startedAt
+      }
+    });
+    write({ type: 'done' });
+    res.end();
+  } catch (error) {
+    const isAborted = abortController.signal?.aborted;
+    if (!isAborted) {
+      const retryAfterMs =
+        Number(error?.headers?.['retry-after-ms']) ||
+        (Number(error?.headers?.['retry-after']) ? Number(error.headers['retry-after']) * 1000 : null);
+      if (error?.status === 429 || error?.code === 'rate_limit_exceeded') {
+        write({ type: 'rate_limited', retryAfterMs });
+      } else {
+        console.error('Error in prefetchDraft:', error);
+        write({ type: 'error', error: error.message || 'Prefetch failed' });
+      }
+    }
+    res.end();
+  }
+};
+
+function _pickTtsChunk(pending, options = {}) {
+  // Smaller chunks => earlier speech (Retell-like).
+  const minLen = options.minLen ?? 22;
+  const maxLen = options.maxLen ?? 160;
+  const text = pending || '';
+  if (text.trim().length < minLen) return { chunk: null, rest: text };
+
+  // Prefer sentence boundaries after minLen
+  const boundaryRe = /[.!?]\s+|\n+/g;
+  let match;
+  while ((match = boundaryRe.exec(text)) !== null) {
+    const endIdx = match.index + match[0].length;
+    if (endIdx >= minLen) {
+      const chunk = text.slice(0, endIdx);
+      const rest = text.slice(endIdx);
+      return { chunk, rest };
+    }
+    if (boundaryRe.lastIndex > maxLen) break;
+  }
+
+  // If too long with no boundary, cut at last space before maxLen
+  if (text.length >= maxLen) {
+    const cut = text.lastIndexOf(' ', maxLen);
+    const endIdx = cut > minLen ? cut : maxLen;
+    const chunk = text.slice(0, endIdx);
+    const rest = text.slice(endIdx);
+    return { chunk, rest };
+  }
+
+  return { chunk: null, rest: text };
+}
+
+function _updateLatencySummary(callRecord) {
+  try {
+    const turns = callRecord.latencyTurns || [];
+    if (!turns.length) return;
+    const avg = (arr) => {
+      const nums = arr.filter((n) => typeof n === 'number' && Number.isFinite(n));
+      if (!nums.length) return null;
+      return Math.round(nums.reduce((a, b) => a + b, 0) / nums.length);
+    };
+    callRecord.latencySummary = {
+      avgE2eFirstAudioMs: avg(turns.map((t) => t.e2eFirstAudioMs)),
+      avgLlmFirstTokenMs: avg(turns.map((t) => t.llmFirstTokenMs)),
+      avgTtsFirstAudioMs: avg(turns.map((t) => t.ttsFirstAudioMs)),
+      lastTurn: {
+        asrFinalMs: turns[turns.length - 1]?.asrFinalMs ?? null,
+        llmFirstTokenMs: turns[turns.length - 1]?.llmFirstTokenMs ?? null,
+        llmTotalMs: turns[turns.length - 1]?.llmTotalMs ?? null,
+        ttsFirstAudioMs: turns[turns.length - 1]?.ttsFirstAudioMs ?? null,
+        ttsTotalMs: turns[turns.length - 1]?.ttsTotalMs ?? null,
+        e2eFirstAudioMs: turns[turns.length - 1]?.e2eFirstAudioMs ?? null
+      }
+    };
+  } catch (e) {
+    // ignore
+  }
+}
+
+/**
+ * Stream chat response with early chunked TTS (Retell-like feel).
+ * Streams NDJSON events:
+ * - { type: 'assistant_delta', delta }
+ * - { type: 'tts_audio', audioUrl, text, index }
+ * - { type: 'latency', latency }
+ * - { type: 'final', text, shouldEndCall }
+ * - { type: 'done' }
+ */
+export const chatStream = async (req, res) => {
+  const startedAt = Date.now();
+  let firstTokenAt = null;
+  let firstTtsAt = null;
+  let ttsDoneAt = null;
+  let llmDoneAt = null;
+  let firstTtsChunkQueuedAt = null;
+
+  // NDJSON streaming
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  // Hint for proxies (nginx) not to buffer streaming responses
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const write = (obj) => {
+    try {
+      res.write(`${JSON.stringify(obj)}\n`);
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  const abortController = new AbortController();
+  req.on('close', () => {
+    try {
+      abortController.abort();
+    } catch (e) {}
+  });
+
+  try {
+    const { message, conversationId, agentId, publicToken, clientTimings } = req.body;
+    if (!message || !conversationId) {
+      write({ type: 'error', error: 'Message and conversationId are required' });
+      return res.end();
+    }
+
+    // Find conversation and verify ownership or public access
+    let conversation;
+    if (publicToken) {
+      conversation = await Conversation.findOne({ _id: conversationId });
+      if (!conversation) {
+        write({ type: 'error', error: 'Conversation not found' });
+        return res.end();
+      }
+    } else {
+      conversation = await Conversation.findOne({ _id: conversationId, userId: req.userId });
+      if (!conversation) {
+        write({ type: 'error', error: 'Conversation not found' });
+        return res.end();
+      }
+    }
+
+    // Get agent first to check functions and get settings
+    let agent = null;
+    if (conversation.agentId) {
+      if (publicToken) {
+        agent = await Agent.findOne({
+          _id: conversation.agentId,
+          shareableToken: publicToken,
+          isPublic: true
+        });
+      } else {
+        agent = await Agent.findOne({ _id: conversation.agentId, userId: req.userId });
+      }
+    } else if (agentId && !publicToken) {
+      agent = await Agent.findOne({ _id: agentId, userId: req.userId });
+    }
+
+    const speechSettings = agent?.speechSettings || {};
+    const openaiModel = speechSettings.openaiModel || 'gpt-4';
+    const language = speechSettings.language || 'en';
+    const functions = agent?.functions || [];
+
+    // Build OpenAI tools (function definitions)
+    const tools = [];
+    let shouldEndCall = false;
+    let triggeredFunction = null;
+
+    for (const func of functions) {
+      if (!func || !func.enabled) continue;
+      if (func.name === 'end_call') {
+        tools.push({
+          type: 'function',
+          function: {
+            name: 'end_call',
+            description:
+              func.description ||
+              "End the call when the client wants to end the conversation, says goodbye, or indicates they don't want to talk anymore. Use this when the conversation should be terminated.",
+            parameters: {
+              type: 'object',
+              properties: {
+                reason: {
+                  type: 'string',
+                  description: 'The reason for ending the call'
+                }
+              },
+              required: ['reason']
+            }
+          }
+        });
+      }
+    }
+
+    // Persist user message
+    conversation.messages.push({ role: 'user', content: message });
+
+    // Convert messages to format expected by OpenAI (skip sentiment here to reduce latency)
+    const messagesForOpenAI = conversation.messages.map((msg) => ({
+      role: msg.role,
+      content: msg.content
+    }));
+
+    // Ensure language instruction is persisted once
+    if (conversation.messages.length > 0 && conversation.messages[0].role === 'system') {
+      const systemMessage = conversation.messages[0].content;
+      if (!systemMessage.includes(`MUST respond in`) && !systemMessage.includes(`respond in ${language}`)) {
+        const languageMap = {
+          en: 'English',
+          es: 'Spanish',
+          fr: 'French',
+          de: 'German',
+          it: 'Italian',
+          pt: 'Portuguese',
+          zh: 'Chinese',
+          ja: 'Japanese',
+          ko: 'Korean',
+          ru: 'Russian',
+          ar: 'Arabic',
+          hi: 'Hindi'
+        };
+        const languageName = languageMap[language] || 'English';
+        const languageInstruction = `\n\nIMPORTANT: You MUST respond in ${languageName} (${language}). All your responses should be in ${languageName} language.`;
+        conversation.messages[0].content = systemMessage + languageInstruction;
+      }
+    }
+
+    // Streaming LLM + chunked TTS
+    let fullText = '';
+    let pendingSpeak = '';
+    const functionCallsAcc = [];
+
+    const audioSegmentIds = [];
+    const ttsQueue = [];
+    let ttsProcessing = false;
+    let ttsIndex = 0;
+    let ttsResolve = null;
+    const ttsIdle = () =>
+      new Promise((resolve) => {
+        if (!ttsQueue.length && !ttsProcessing) return resolve();
+        ttsResolve = resolve;
+      });
+
+    const drainTtsQueue = async () => {
+      if (ttsProcessing) return;
+      ttsProcessing = true;
+      try {
+        while (ttsQueue.length && !abortController.signal.aborted) {
+          const chunkText = (ttsQueue.shift() || '').trim();
+          if (!chunkText) continue;
+
+          const ttsStart = Date.now();
+          const audioFileId = await textToSpeech(chunkText, {
+            voiceId: speechSettings.voiceId || config.elevenlabs.voiceId,
+            modelId: speechSettings.modelId || config.elevenlabs.modelId,
+            stability: speechSettings.stability ?? 0.5,
+            similarity_boost: speechSettings.similarityBoost ?? 0.75,
+            type: 'conversation'
+          });
+          const ttsEnd = Date.now();
+
+          if (!firstTtsAt) firstTtsAt = ttsEnd;
+          ttsDoneAt = ttsEnd;
+
+          if (audioFileId) {
+            audioSegmentIds.push(audioFileId);
+            write({
+              type: 'tts_audio',
+              index: ttsIndex++,
+              text: chunkText,
+              audioUrl: `/api/audio/${audioFileId}`,
+              ttsMs: ttsEnd - ttsStart
+            });
+          }
+        }
+      } catch (e) {
+        if (!abortController.signal.aborted) {
+          console.error('TTS queue error:', e);
+          write({ type: 'tts_error', error: e.message || 'TTS failed' });
+        }
+      } finally {
+        ttsProcessing = false;
+        if (ttsResolve && !ttsQueue.length) {
+          const r = ttsResolve;
+          ttsResolve = null;
+          r();
+        }
+      }
+    };
+
+    const maybeQueueChunks = () => {
+      // Pull as many ready chunks as possible
+      while (true) {
+        const { chunk, rest } = _pickTtsChunk(pendingSpeak, { minLen: 22, maxLen: 160 });
+        if (!chunk) break;
+        pendingSpeak = rest || '';
+        ttsQueue.push(chunk);
+        if (!firstTtsChunkQueuedAt) firstTtsChunkQueuedAt = Date.now();
+      }
+      // If we haven't queued anything yet, force an early chunk after a short time budget.
+      // This prevents "text appears fast but audio starts 5s later" feeling.
+      if (!firstTtsChunkQueuedAt && firstTokenAt) {
+        const msSinceFirstToken = Date.now() - firstTokenAt;
+        const trimmedLen = (pendingSpeak || '').trim().length;
+        if (msSinceFirstToken >= 650 && trimmedLen >= 18) {
+          // Cut at a reasonable boundary (space) to avoid mid-word.
+          const maxLen = 120;
+          const cut = pendingSpeak.lastIndexOf(' ', Math.min(maxLen, pendingSpeak.length));
+          const endIdx = cut > 10 ? cut : Math.min(maxLen, pendingSpeak.length);
+          const forced = pendingSpeak.slice(0, endIdx);
+          pendingSpeak = pendingSpeak.slice(endIdx);
+          ttsQueue.push(forced);
+          firstTtsChunkQueuedAt = Date.now();
+        }
+      }
+      if (ttsQueue.length) {
+        // async drain
+        drainTtsQueue();
+      }
+    };
+
+    const { content: aiResponse, tokensUsed, functionCalls } = await getStreamingAIResponse(
+      messagesForOpenAI,
+      {
+        model: openaiModel,
+        temperature: 0.7,
+        // Voice calls shouldn't generate huge essays; smaller output is faster.
+        max_tokens: 260,
+        tools: tools.length > 0 ? tools : undefined,
+        tool_choice: 'auto',
+        signal: abortController.signal
+      },
+      (delta) => {
+        if (!firstTokenAt) firstTokenAt = Date.now();
+        fullText += delta;
+        pendingSpeak += delta;
+        write({ type: 'assistant_delta', delta });
+        maybeQueueChunks();
+      }
+    );
+    llmDoneAt = Date.now();
+
+    if (functionCalls && functionCalls.length) {
+      for (const fc of functionCalls) functionCallsAcc.push(fc);
+    }
+
+    // Determine if end_call triggered
+    if (tools.length > 0 && functionCallsAcc.length > 0) {
+      for (const funcCall of functionCallsAcc) {
+        if (funcCall.function.name === 'end_call') {
+          const endCallFunc = functions.find((f) => f.name === 'end_call' && f.enabled);
+          if (endCallFunc) {
+            shouldEndCall = true;
+            triggeredFunction = { name: 'end_call' };
+            break;
+          }
+        }
+      }
+    }
+
+    let finalAiResponse = (aiResponse || fullText || '').trim();
+    if (!finalAiResponse) {
+      finalAiResponse = shouldEndCall ? 'Goodbye! Have a great day.' : "Sorry — I didn't catch that. Could you repeat?";
+    }
+
+    // Enqueue remaining text for TTS
+    if (pendingSpeak.trim()) {
+      ttsQueue.push(pendingSpeak);
+      pendingSpeak = '';
+      drainTtsQueue();
+    }
+
+    // Wait for TTS queue to finish before closing response
+    await ttsIdle();
+
+    // Persist assistant message + audio segments
+    conversation.messages.push({ role: 'assistant', content: finalAiResponse });
+    conversation.audioSegments = conversation.audioSegments || [];
+    if (audioSegmentIds.length) {
+      conversation.audioSegments.push(...audioSegmentIds);
+    }
+    await conversation.save();
+
+    // Update call history: messages, cost, latency
+    const userId = publicToken ? (conversation.userId || null) : req.userId;
+    const callRecord = userId
+      ? await CallHistory.findOne({ conversationId: conversationId, userId: userId, status: 'active' })
+      : null;
+
+    if (callRecord) {
+      callRecord.messages = conversation.messages
+        .filter((msg) => msg.role !== 'system')
+        .map((msg) => ({ role: msg.role, content: msg.content }));
+
+      let costPer1K = 0.03;
+      if (openaiModel.includes('gpt-4o')) costPer1K = 0.01;
+      else if (openaiModel.includes('gpt-3.5')) costPer1K = 0.002;
+      else if (openaiModel.includes('gpt-4-turbo')) costPer1K = 0.01;
+      const messageCost = (tokensUsed / 1000) * costPer1K;
+      callRecord.cost = (callRecord.cost || 0) + messageCost;
+
+      // Latency turn
+      const asrFinalMs =
+        clientTimings && typeof clientTimings.asr_final_ms === 'number' ? clientTimings.asr_final_ms : null;
+      const llmFirstTokenMs = firstTokenAt ? firstTokenAt - startedAt : null;
+      const llmTotalMs = llmDoneAt ? llmDoneAt - startedAt : Date.now() - startedAt;
+      const ttsFirstAudioMs = firstTtsAt ? firstTtsAt - startedAt : null;
+      const ttsTotalMs = ttsDoneAt ? ttsDoneAt - startedAt : null;
+      const e2eFirstAudioMs = firstTtsAt ? firstTtsAt - startedAt : null;
+
+      callRecord.latencyTurns = callRecord.latencyTurns || [];
+      callRecord.latencyTurns.push({
+        userText: message,
+        mode: 'chunked_tts',
+        asrFinalMs,
+        llmFirstTokenMs,
+        llmTotalMs,
+        ttsFirstAudioMs,
+        ttsTotalMs,
+        e2eFirstAudioMs
+      });
+      _updateLatencySummary(callRecord);
+
+      // If end_call function was triggered, end call
+      if (shouldEndCall && triggeredFunction) {
+        callRecord.status = 'ended';
+        callRecord.endTime = new Date();
+        callRecord.endReason = 'function_triggered';
+        const duration = Math.floor((callRecord.endTime - callRecord.startTime) / 1000);
+        callRecord.duration = duration;
+      }
+
+      await callRecord.save();
+    }
+
+    write({
+      type: 'latency',
+      latency: {
+        llmFirstTokenMs: firstTokenAt ? firstTokenAt - startedAt : null,
+        llmTotalMs: llmDoneAt ? llmDoneAt - startedAt : null,
+        ttsFirstAudioMs: firstTtsAt ? firstTtsAt - startedAt : null,
+        ttsTotalMs: ttsDoneAt ? ttsDoneAt - startedAt : null,
+        e2eFirstAudioMs: firstTtsAt ? firstTtsAt - startedAt : null
+      }
+    });
+    write({ type: 'final', text: finalAiResponse, shouldEndCall: !!shouldEndCall });
+    write({ type: 'done' });
+    res.end();
+  } catch (error) {
+    const isAborted = abortController.signal?.aborted;
+    if (!isAborted) {
+      const retryAfterMs =
+        Number(error?.headers?.['retry-after-ms']) ||
+        (Number(error?.headers?.['retry-after']) ? Number(error.headers['retry-after']) * 1000 : null);
+      if (error?.status === 429 || error?.code === 'rate_limit_exceeded') {
+        write({ type: 'rate_limited', retryAfterMs });
+      } else {
+        console.error('Error in chatStream:', error);
+        write({ type: 'error', error: error.message || 'Failed to process chat stream' });
+      }
+    }
+    res.end();
   }
 };
 

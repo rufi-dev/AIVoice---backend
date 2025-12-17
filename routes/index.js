@@ -5,7 +5,7 @@ import knowledgeBasesRoutes from './knowledgeBases.js';
 import conversationsRoutes from './conversations.js';
 import callHistoryRoutes from './callHistory.js';
 import voicesRoutes from './voices.js';
-import { authenticate } from '../middleware/auth.js';
+import { authenticate, optionalAuth } from '../middleware/auth.js';
 import { serveAudioFromGridFS } from '../controllers/audioController.js';
 import { getStorageStats, cleanupAudio } from '../controllers/audioManagementController.js';
 import { getAgentByToken } from '../controllers/publicAgentController.js';
@@ -29,7 +29,8 @@ router.use('/auth', authRoutes);
 // Protected API routes - require authentication
 router.use('/agents', authenticate, agentsRoutes);
 router.use('/knowledge-bases', authenticate, knowledgeBasesRoutes);
-router.use('/conversation', authenticate, conversationsRoutes);
+// Conversations support authenticated and public-token access
+router.use('/conversation', optionalAuth, conversationsRoutes);
 router.use('/call-history', authenticate, callHistoryRoutes);
 router.use('/voices', authenticate, voicesRoutes);
 router.get('/audio-stats', authenticate, getStorageStats);
