@@ -9,6 +9,18 @@ import { getSentimentContext } from '../services/sentimentService.js';
 import { config } from '../config/index.js';
 import { mergeConversationAudio, deleteTemporaryAudioSegments } from '../services/audioMergeService.js';
 
+function toAudioUrl(fileOrPath) {
+  if (!fileOrPath) return null;
+  const v = String(fileOrPath);
+  if (!v) return null;
+  if (v.startsWith('http://') || v.startsWith('https://')) return v;
+  if (v.startsWith('/api/audio/')) return v;
+  // elevenLabsService fallback returns `/audio/<file>.mp3`
+  if (v.startsWith('/audio/')) return v;
+  if (mongoose.Types.ObjectId.isValid(v)) return `/api/audio/${v}`;
+  return v.startsWith('/') ? v : `/api/audio/${v}`;
+}
+
 /**
  * Start a new conversation
  */
@@ -174,8 +186,8 @@ export const startConversation = async (req, res) => {
             await conversation.save();
           }
           
-          // Return URL to access the audio from GridFS (temporary)
-          initialAudioUrl = `/api/audio/${greetingAudioFileId}`;
+          // Return URL to access the audio (GridFS id or fallback path)
+          initialAudioUrl = toAudioUrl(greetingAudioFileId);
         } catch (ttsError) {
           console.error('Error generating initial greeting audio:', ttsError);
         }
@@ -484,7 +496,7 @@ export const chat = async (req, res) => {
           await conversation.save();
         }
         
-        audioUrl = `/api/audio/${audioFileId}`;
+        audioUrl = toAudioUrl(audioFileId);
       } catch (error) {
         console.error('Error generating audio for end_call:', error);
       }
@@ -540,7 +552,7 @@ export const chat = async (req, res) => {
       }
       
       // Return URL to access the audio from GridFS (temporary)
-      audioUrl = `/api/audio/${audioFileId}`;
+      audioUrl = toAudioUrl(audioFileId);
     } catch (ttsError) {
       console.error('Text-to-speech error:', ttsError);
       // Continue without audio if TTS fails
@@ -953,13 +965,17 @@ export const chatStream = async (req, res) => {
           if (!firstTtsAt) firstTtsAt = ttsEnd;
           ttsDoneAt = ttsEnd;
 
-          if (audioFileId) {
-            audioSegmentIds.push(audioFileId);
+          const audioUrl = toAudioUrl(audioFileId);
+          if (audioUrl) {
+            // Only keep mergeable GridFS ids for later merging
+            if (mongoose.Types.ObjectId.isValid(String(audioFileId))) {
+              audioSegmentIds.push(String(audioFileId));
+            }
             write({
               type: 'tts_audio',
               index: ttsIndex++,
               text: chunkText,
-              audioUrl: `/api/audio/${audioFileId}`,
+              audioUrl,
               ttsMs: ttsEnd - ttsStart
             });
           }
@@ -1210,7 +1226,7 @@ export const getCuttingPhrase = async (req, res) => {
         await conversation.save();
       }
       // Return URL to access the audio from GridFS
-      cuttingAudioUrl = `/api/audio/${cuttingAudioFileId}`;
+      cuttingAudioUrl = toAudioUrl(cuttingAudioFileId);
     } catch (ttsError) {
       console.error('Error generating cutting phrase audio:', ttsError);
     }
@@ -1331,7 +1347,7 @@ export const endConversation = async (req, res) => {
           );
           
           // Store the merged audio file ID in call history
-          callRecord.audioUrl = `/api/audio/${mergedAudioFileId}`;
+          callRecord.audioUrl = toAudioUrl(mergedAudioFileId);
           console.log(`✅ Full conversation audio saved: ${mergedAudioFileId}`);
           
           // Delete temporary audio segments after merging

@@ -21,6 +21,7 @@ export const serveAudioFromGridFS = async (req, res) => {
       return res.status(400).json({ error: 'File ID is required' });
     }
 
+    
     // Validate ObjectId format
     if (!mongoose.Types.ObjectId.isValid(fileId)) {
       console.error('❌ Invalid file ID format:', fileId);
