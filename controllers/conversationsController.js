@@ -2,12 +2,44 @@ import Conversation from '../models/Conversation.js';
 import CallHistory from '../models/CallHistory.js';
 import Agent from '../models/Agent.js';
 import KnowledgeBase from '../models/KnowledgeBase.js';
+import mongoose from 'mongoose';
 import { buildSystemPrompt } from '../services/promptService.js';
 import { getAIResponse, getStreamingAIResponse } from '../services/openaiService.js';
 import { textToSpeech } from '../services/elevenLabsService.js';
 import { getSentimentContext } from '../services/sentimentService.js';
 import { config } from '../config/index.js';
 import { mergeConversationAudio, deleteTemporaryAudioSegments } from '../services/audioMergeService.js';
+
+function sanitizeForSpeech(input) {
+  if (!input) return '';
+  let s = String(input);
+  // Remove code fences/backticks that often create weird speech
+  s = s.replace(/```[\s\S]*?```/g, ' ');
+  s = s.replace(/`+/g, '');
+  // Remove common "unreadable" symbol noise
+  s = s.replace(/[{}\[\]<>]/g, ' ');
+  s = s.replace(/[*^%$#@|~]/g, ' ');
+  // Drop control characters
+  s = s.replace(/[\u0000-\u001F\u007F]/g, ' ');
+  // Collapse whitespace
+  s = s.replace(/\s+/g, ' ');
+  return s;
+}
+
+function _findSafeCutIndex(text, maxLen, minLen) {
+  const t = text || '';
+  const hardMax = Math.min(maxLen, t.length);
+  if (hardMax <= minLen) return hardMax;
+
+  // Prefer breaking at whitespace or punctuation so we don't cut mid-word.
+  for (let i = hardMax; i > minLen; i--) {
+    const ch = t[i - 1];
+    if (/\s/.test(ch)) return i;
+    if (/[.!?,;:\n]/.test(ch)) return i;
+  }
+
+  return hardMax;
+}
 
 function toAudioUrl(fileOrPath) {
   if (!fileOrPath) return null;
@@ -746,8 +778,7 @@ function _pickTtsChunk(pending, options = {}) {
 
   // If too long with no boundary, cut at last space before maxLen
   if (text.length >= maxLen) {
-    const cut = text.lastIndexOf(' ', maxLen);
-    const endIdx = cut > minLen ? cut : maxLen;
+    const endIdx = _findSafeCutIndex(text, maxLen, minLen);
     const chunk = text.slice(0, endIdx);
     const rest = text.slice(endIdx);
     return { chunk, rest };
@@ -939,6 +970,7 @@ export const chatStream = async (req, res) => {
     const ttsQueue = [];
     let ttsProcessing = false;
     let ttsIndex = 0;
+    let spokenUpTo = 0;
     let ttsResolve = null;
     const ttsIdle = () =>
       new Promise((resolve) => {
@@ -951,11 +983,15 @@ export const chatStream = async (req, res) => {
       ttsProcessing = true;
       try {
         while (ttsQueue.length && !abortController.signal.aborted) {
-          const chunkText = (ttsQueue.shift() || '').trim();
-          if (!chunkText) continue;
+          const chunkRaw = String(ttsQueue.shift() || '');
+          // Advance spoken pointer based on the exact queued characters (prevents UI flicker).
+          spokenUpTo += chunkRaw.length;
+
+          const ttsText = sanitizeForSpeech(chunkRaw).trim();
+          if (!ttsText) continue;
 
           const ttsStart = Date.now();
-          const audioFileId = await textToSpeech(chunkText, {
+          const audioFileId = await textToSpeech(ttsText, {
             voiceId: speechSettings.voiceId || config.elevenlabs.voiceId,
             modelId: speechSettings.modelId || config.elevenlabs.modelId,
             stability: speechSettings.stability ?? 0.5,
@@ -976,7 +1012,9 @@ export const chatStream = async (req, res) => {
             write({
               type: 'tts_audio',
               index: ttsIndex++,
-              text: chunkText,
+              // Send exact chunk so frontend can stay aligned with assistant_delta text
+              text: chunkRaw,
+              spokenUpTo,
               audioUrl,
               ttsMs: ttsEnd - ttsStart
             });
@@ -1014,8 +1052,7 @@ export const chatStream = async (req, res) => {
         if (msSinceFirstToken >= 650 && trimmedLen >= 18) {
           // Cut at a reasonable boundary (space) to avoid mid-word.
           const maxLen = 120;
-          const cut = pendingSpeak.lastIndexOf(' ', Math.min(maxLen, pendingSpeak.length));
-          const endIdx = cut > 10 ? cut : Math.min(maxLen, pendingSpeak.length);
+          const endIdx = _findSafeCutIndex(pendingSpeak, maxLen, 10);
           const forced = pendingSpeak.slice(0, endIdx);
           pendingSpeak = pendingSpeak.slice(endIdx);
           ttsQueue.push(forced);
@@ -1041,9 +1078,11 @@ export const chatStream = async (req, res) => {
       },
       (delta) => {
         if (!firstTokenAt) firstTokenAt = Date.now();
-        fullText += delta;
-        pendingSpeak += delta;
-        write({ type: 'assistant_delta', delta });
+        const cleanDelta = sanitizeForSpeech(delta);
+        if (!cleanDelta) return;
+        fullText += cleanDelta;
+        pendingSpeak += cleanDelta;
+        write({ type: 'assistant_delta', delta: cleanDelta });
         maybeQueueChunks();
       }
     );
@@ -1067,7 +1106,7 @@ export const chatStream = async (req, res) => {
       }
     }
 
-    let finalAiResponse = (aiResponse || fullText || '').trim();
+    let finalAiResponse = sanitizeForSpeech(aiResponse || fullText || '').trim();
     if (!finalAiResponse) {
       finalAiResponse = shouldEndCall ? 'Goodbye! Have a great day.' : "Sorry — I didn't catch that. Could you repeat?";
     }

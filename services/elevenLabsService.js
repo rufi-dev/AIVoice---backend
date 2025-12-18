@@ -5,6 +5,22 @@ import crypto from 'crypto';
 import { config } from '../config/index.js';
 import { getCachedAudio, storeAudioWithMetadata } from './audioCacheService.js';
 
+function sanitizeForTts(input) {
+  if (!input) return '';
+  let s = String(input);
+  // Remove code blocks/backticks
+  s = s.replace(/```[\s\S]*?```/g, ' ');
+  s = s.replace(/`+/g, '');
+  // Remove common symbol noise that TTS pronounces awkwardly
+  s = s.replace(/[{}\[\]<>]/g, ' ');
+  s = s.replace(/[*^%$#@|~]/g, ' ');
+  // Drop control chars
+  s = s.replace(/[\u0000-\u001F\u007F]/g, ' ');
+  // Collapse whitespace
+  s = s.replace(/\s+/g, ' ').trim();
+  return s;
+}
+
 // Ensure mongoose connection is ready
 const getDb = () => {
   if (!mongoose.connection.db) {
@@ -21,6 +37,10 @@ const getDb = () => {
  */
 export async function textToSpeech(text, options = {}) {
   try {
+    const cleanedText = sanitizeForTts(text);
+    if (!cleanedText) {
+      throw new Error('TTS input is empty after sanitization');
+    }
     const voiceId = options.voiceId || config.elevenlabs.voiceId;
     const apiKey = config.elevenlabs.apiKey;
     const modelId = options.modelId || config.elevenlabs.modelId;
@@ -29,7 +49,7 @@ export async function textToSpeech(text, options = {}) {
     console.log('🔊 ElevenLabs TTS called with:', {
       voiceId: voiceId,
       modelId: modelId,
-      textLength: text.length,
+      textLength: cleanedText.length,
       hasVoiceId: !!voiceId
     });
 
@@ -56,7 +76,7 @@ export async function textToSpeech(text, options = {}) {
       const response = await axios.post(
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
         {
-          text: text,
+          text: cleanedText,
           model_id: modelId,
           voice_settings: voiceSettings,
         },
@@ -77,7 +97,7 @@ export async function textToSpeech(text, options = {}) {
     // Check cache first for other types (if needed)
     if (useCache) {
       const cachedFileId = await getCachedAudio(
-        text, 
+        cleanedText, 
         voiceId, 
         options.modelId || config.elevenlabs.modelId,
         voiceSettings.stability,
@@ -96,7 +116,7 @@ export async function textToSpeech(text, options = {}) {
     const response = await axios.post(
       apiUrl,
       {
-        text: text,
+        text: cleanedText,
         model_id: modelId,
         voice_settings: voiceSettings,
       },
@@ -121,7 +141,7 @@ export async function textToSpeech(text, options = {}) {
       
       // Generate cache key for previews (not used for temporary)
       const cacheKey = useCache ? crypto.createHash('md5')
-        .update(`${text}|${voiceId}|${options.modelId || config.elevenlabs.modelId}|${voiceSettings.stability}|${voiceSettings.similarity_boost}`)
+        .update(`${cleanedText}|${voiceId}|${options.modelId || config.elevenlabs.modelId}|${voiceSettings.stability}|${voiceSettings.similarity_boost}`)
         .digest('hex') : null;
       
       // Store with metadata
@@ -130,7 +150,7 @@ export async function textToSpeech(text, options = {}) {
         cacheKey: cacheKey,
         voiceId: voiceId,
         modelId: options.modelId || config.elevenlabs.modelId,
-        textLength: text.length
+        textLength: cleanedText.length
       });
       
       return fileId;
