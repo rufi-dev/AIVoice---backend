@@ -208,3 +208,54 @@ export async function textToSpeech(text, options = {}) {
   }
 }
 
+/**
+ * Stream text-to-speech audio directly from ElevenLabs (no GridFS save).
+ * Returns a Node.js Readable stream (response.data).
+ *
+ * Uses ElevenLabs streaming endpoint + optimize_streaming_latency.
+ */
+export async function streamTextToSpeech(text, options = {}) {
+  const cleanedText = sanitizeForTts(text);
+  if (!cleanedText) {
+    throw new Error('TTS input is empty after sanitization');
+  }
+
+  const voiceId = options.voiceId || config.elevenlabs.voiceId;
+  const apiKey = config.elevenlabs.apiKey;
+  const modelId = options.modelId || config.elevenlabs.modelId;
+  const optimize = Number.isFinite(options.optimize_streaming_latency)
+    ? options.optimize_streaming_latency
+    : 3;
+
+  if (!apiKey) throw new Error('ElevenLabs API key not configured');
+  if (!voiceId) throw new Error('Voice ID is required for text-to-speech');
+
+  const voiceSettings = {
+    stability: options.stability ?? 0.5,
+    similarity_boost: options.similarity_boost ?? 0.75
+  };
+
+  const apiUrl = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=${encodeURIComponent(
+    String(optimize)
+  )}`;
+
+  const response = await axios.post(
+    apiUrl,
+    {
+      text: cleanedText,
+      model_id: modelId,
+      voice_settings: voiceSettings
+    },
+    {
+      headers: {
+        Accept: 'audio/mpeg',
+        'Content-Type': 'application/json',
+        'xi-api-key': apiKey
+      },
+      responseType: 'stream'
+    }
+  );
+
+  return response.data;
+}
+

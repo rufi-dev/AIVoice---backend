@@ -83,9 +83,21 @@ export const getCallStatsByConversation = async (req, res) => {
     const costPerMin = call.cost ? (call.cost / (elapsedSec / 60)) : 0;
 
     const turns = call.latencyTurns || [];
-    const latVals = turns.map(t => t?.e2eFirstAudioMs).filter(v => typeof v === 'number' && Number.isFinite(v));
-    const tokVals = turns.map(t => t?.tokensUsed).filter(v => typeof v === 'number' && Number.isFinite(v));
+    const nums = (arr) => arr.filter((v) => typeof v === 'number' && Number.isFinite(v));
+    const avgOf = (field) => {
+      const vals = nums(turns.map((t) => t?.[field]));
+      if (!vals.length) return null;
+      return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+    };
+    const rangeOf = (field) => {
+      const vals = nums(turns.map((t) => t?.[field]));
+      return vals.length ? { min: Math.min(...vals), max: Math.max(...vals) } : null;
+    };
+
+    const tokVals = nums(turns.map((t) => t?.tokensUsed));
+    const avgTokensUsed = tokVals.length ? Math.round(tokVals.reduce((a, b) => a + b, 0) / tokVals.length) : null;
     const model = turns.length ? (turns[turns.length - 1]?.llmModel || null) : null;
+    const last = turns.length ? turns[turns.length - 1] : null;
 
     const stats = {
       callId: call._id.toString(),
@@ -95,9 +107,30 @@ export const getCallStatsByConversation = async (req, res) => {
       status: call.status,
       costTotal: call.cost || 0,
       costPerMin: costPerMin || 0,
-      latencyRangeMs: latVals.length ? { min: Math.min(...latVals), max: Math.max(...latVals) } : null,
+      avgLatencyMs: call.latencySummary?.avgE2eFirstAudioMs ?? avgOf('e2eFirstAudioMs'),
+      avgTokensUsed,
+      // End-to-end (first audible audio) range
+      latencyRangeMs: rangeOf('e2eFirstAudioMs'),
+      // Component ranges
+      asrFinalRangeMs: rangeOf('asrFinalMs'),
+      llmFirstTokenRangeMs: rangeOf('llmFirstTokenMs'),
+      llmTotalRangeMs: rangeOf('llmTotalMs'),
+      ttsFirstAudioRangeMs: rangeOf('ttsFirstAudioMs'),
+      ttsTotalRangeMs: rangeOf('ttsTotalMs'),
       tokensRange: tokVals.length ? { min: Math.min(...tokVals), max: Math.max(...tokVals) } : null,
-      llmModel: model
+      llmModel: model,
+      lastTurn: last
+        ? {
+            asrFinalMs: last.asrFinalMs ?? null,
+            llmFirstTokenMs: last.llmFirstTokenMs ?? null,
+            llmTotalMs: last.llmTotalMs ?? null,
+            ttsFirstAudioMs: last.ttsFirstAudioMs ?? null,
+            ttsTotalMs: last.ttsTotalMs ?? null,
+            e2eFirstAudioMs: last.e2eFirstAudioMs ?? null,
+            tokensUsed: last.tokensUsed ?? null,
+            llmModel: last.llmModel ?? null
+          }
+        : null
     };
 
     res.json(stats);

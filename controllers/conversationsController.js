@@ -9,6 +9,18 @@ import { textToSpeech } from '../services/elevenLabsService.js';
 import { getSentimentContext } from '../services/sentimentService.js';
 import { config } from '../config/index.js';
 import { mergeConversationAudio, deleteTemporaryAudioSegments } from '../services/audioMergeService.js';
+import crypto from 'crypto';
+import { createTtsToken, finalizeTurnMetrics, getTurnMetrics, initTurnMetrics } from './ttsController.js';
+
+async function waitForTurnMetric(turnId, field, timeoutMs = 2500, pollMs = 25) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const m = getTurnMetrics(turnId);
+    if (m && m[field]) return m[field];
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return null;
+}
 
 function sanitizeForSpeech(input) {
   if (!input) return '';
@@ -39,6 +51,35 @@ function _findSafeCutIndex(text, maxLen, minLen) {
   }
 
   return hardMax;
+}
+
+function _extendCutToAvoidTinyTail(text, endIdx, options = {}) {
+  const t = text || '';
+  const maxOverflow = options.maxOverflow ?? 40;
+  const minTailChars = options.minTailChars ?? 18;
+
+  if (!endIdx || endIdx >= t.length) return endIdx;
+  const rest = t.slice(endIdx);
+  const restTrimmed = rest.trimStart();
+
+  // If the remaining piece is tiny, prefer to include it in this chunk (avoid awkward pause).
+  if (restTrimmed.length > 0 && restTrimmed.length <= minTailChars) {
+    return Math.min(t.length, endIdx + Math.min(maxOverflow, rest.length));
+  }
+
+  // If tail starts with connective words ("to", "and", "but", ...) and is short, extend.
+  if (/^(to|and|or|but|because|that|so|for)\b/i.test(restTrimmed) && restTrimmed.length <= minTailChars + 10) {
+    return Math.min(t.length, endIdx + Math.min(maxOverflow, rest.length));
+  }
+
+  // If a sentence-ending punctuation is very close after the cut, include it.
+  const slice = t.slice(endIdx, Math.min(t.length, endIdx + maxOverflow));
+  const m = slice.match(/[.!?](\s|$)/);
+  if (m && typeof m.index === 'number') {
+    return Math.min(t.length, endIdx + m.index + 1);
+  }
+
+  return endIdx;
 }
 
 function toAudioUrl(fileOrPath) {
@@ -203,23 +244,16 @@ export const startConversation = async (req, res) => {
             allSpeechSettings: speechSettings
           });
           
-          const greetingAudioFileId = await textToSpeech(greetingText, {
-            voiceId: actualVoiceId || config.elevenlabs.voiceId,
-            modelId: speechSettings.modelId || config.elevenlabs.modelId,
-            stability: speechSettings.stability ?? 0.5,
-            similarity_boost: speechSettings.similarityBoost ?? 0.75,
-            type: 'conversation' // Will be saved as temporary segment
-          });
-          
-          // Track this audio segment in conversation for later merging
-          if (conversation && greetingAudioFileId) {
-            conversation.audioSegments = conversation.audioSegments || [];
-            conversation.audioSegments.push(greetingAudioFileId);
-            await conversation.save();
-          }
-          
-          // Return URL to access the audio (GridFS id or fallback path)
-          initialAudioUrl = toAudioUrl(greetingAudioFileId);
+        const token = createTtsToken({
+          text: greetingText,
+          voiceId: actualVoiceId || config.elevenlabs.voiceId,
+          modelId: speechSettings.modelId || config.elevenlabs.modelId,
+          stability: speechSettings.stability ?? 0.5,
+          similarity_boost: speechSettings.similarityBoost ?? 0.75,
+          optimize_streaming_latency: 3,
+          turnId: null
+        });
+        initialAudioUrl = `/api/tts/${token}`;
         } catch (ttsError) {
           console.error('Error generating initial greeting audio:', ttsError);
         }
@@ -515,22 +549,16 @@ export const chat = async (req, res) => {
           modelId: speechSettings.modelId || config.elevenlabs.modelId,
         });
         
-        const audioFileId = await textToSpeech(finalAiResponse, {
-          voiceId: actualVoiceId,
+        const token = createTtsToken({
+          text: finalAiResponse,
+          voiceId: actualVoiceId || config.elevenlabs.voiceId,
           modelId: speechSettings.modelId || config.elevenlabs.modelId,
           stability: speechSettings.stability ?? 0.5,
           similarity_boost: speechSettings.similarityBoost ?? 0.75,
-          type: 'conversation' // Will be saved as temporary segment
+          optimize_streaming_latency: 3,
+          turnId: null
         });
-        
-        // Track this audio segment in conversation for later merging
-        if (conversation && audioFileId) {
-          conversation.audioSegments = conversation.audioSegments || [];
-          conversation.audioSegments.push(audioFileId);
-          await conversation.save();
-        }
-        
-        audioUrl = toAudioUrl(audioFileId);
+        audioUrl = `/api/tts/${token}`;
       } catch (error) {
         console.error('Error generating audio for end_call:', error);
       }
@@ -570,23 +598,16 @@ export const chat = async (req, res) => {
         console.log('✅ Using custom voice:', actualVoiceId, speechSettings.voiceName);
       }
       
-      const audioFileId = await textToSpeech(finalAiResponse, {
+      const token = createTtsToken({
+        text: finalAiResponse,
         voiceId: actualVoiceId || config.elevenlabs.voiceId,
         modelId: speechSettings.modelId || config.elevenlabs.modelId,
         stability: speechSettings.stability ?? 0.5,
         similarity_boost: speechSettings.similarityBoost ?? 0.75,
-        type: 'conversation' // Will be saved as temporary segment
+        optimize_streaming_latency: 3,
+        turnId: null
       });
-      
-      // Track this audio segment in conversation for later merging
-      if (conversation && audioFileId) {
-        conversation.audioSegments = conversation.audioSegments || [];
-        conversation.audioSegments.push(audioFileId);
-        await conversation.save();
-      }
-      
-      // Return URL to access the audio from GridFS (temporary)
-      audioUrl = toAudioUrl(audioFileId);
+      audioUrl = `/api/tts/${token}`;
     } catch (ttsError) {
       console.error('Text-to-speech error:', ttsError);
       // Continue without audio if TTS fails
@@ -778,7 +799,8 @@ function _pickTtsChunk(pending, options = {}) {
 
   // If too long with no boundary, cut at last space before maxLen
   if (text.length >= maxLen) {
-    const endIdx = _findSafeCutIndex(text, maxLen, minLen);
+    let endIdx = _findSafeCutIndex(text, maxLen, minLen);
+    endIdx = _extendCutToAvoidTinyTail(text, endIdx, { maxOverflow: 40, minTailChars: 18 });
     const chunk = text.slice(0, endIdx);
     const rest = text.slice(endIdx);
     return { chunk, rest };
@@ -826,10 +848,11 @@ function _updateLatencySummary(callRecord) {
 export const chatStream = async (req, res) => {
   const startedAt = Date.now();
   let firstTokenAt = null;
-  let firstTtsAt = null;
-  let ttsDoneAt = null;
+  // TTS timing is captured via /api/tts streaming first-byte timestamps.
   let llmDoneAt = null;
   let firstTtsChunkQueuedAt = null;
+  const turnId = crypto.randomBytes(8).toString('hex');
+  initTurnMetrics(turnId, startedAt);
 
   // NDJSON streaming
   res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
@@ -894,7 +917,7 @@ export const chatStream = async (req, res) => {
     }
 
     const speechSettings = agent?.speechSettings || {};
-    const openaiModel = speechSettings.openaiModel || 'gpt-4';
+    const openaiModel = speechSettings.openaiModel || 'gpt-4o-mini';
     const language = speechSettings.language || 'en';
     const functions = agent?.functions || [];
 
@@ -966,71 +989,40 @@ export const chatStream = async (req, res) => {
     let pendingSpeak = '';
     const functionCallsAcc = [];
 
-    const audioSegmentIds = [];
     const ttsQueue = [];
-    let ttsProcessing = false;
     let ttsIndex = 0;
     let spokenUpTo = 0;
-    let ttsResolve = null;
-    const ttsIdle = () =>
-      new Promise((resolve) => {
-        if (!ttsQueue.length && !ttsProcessing) return resolve();
-        ttsResolve = resolve;
-      });
-
-    const drainTtsQueue = async () => {
-      if (ttsProcessing) return;
-      ttsProcessing = true;
+    const drainTtsQueue = () => {
       try {
         while (ttsQueue.length && !abortController.signal.aborted) {
           const chunkRaw = String(ttsQueue.shift() || '');
+          if (!chunkRaw) continue;
           // Advance spoken pointer based on the exact queued characters (prevents UI flicker).
           spokenUpTo += chunkRaw.length;
 
-          const ttsText = sanitizeForSpeech(chunkRaw).trim();
-          if (!ttsText) continue;
-
-          const ttsStart = Date.now();
-          const audioFileId = await textToSpeech(ttsText, {
+          const token = createTtsToken({
+            text: chunkRaw,
             voiceId: speechSettings.voiceId || config.elevenlabs.voiceId,
             modelId: speechSettings.modelId || config.elevenlabs.modelId,
             stability: speechSettings.stability ?? 0.5,
             similarity_boost: speechSettings.similarityBoost ?? 0.75,
-            type: 'conversation'
+            optimize_streaming_latency: 3,
+            turnId
           });
-          const ttsEnd = Date.now();
 
-          if (!firstTtsAt) firstTtsAt = ttsEnd;
-          ttsDoneAt = ttsEnd;
-
-          const audioUrl = toAudioUrl(audioFileId);
-          if (audioUrl) {
-            // Only keep mergeable GridFS ids for later merging
-            if (mongoose.Types.ObjectId.isValid(String(audioFileId))) {
-              audioSegmentIds.push(String(audioFileId));
-            }
-            write({
-              type: 'tts_audio',
-              index: ttsIndex++,
-              // Send exact chunk so frontend can stay aligned with assistant_delta text
-              text: chunkRaw,
-              spokenUpTo,
-              audioUrl,
-              ttsMs: ttsEnd - ttsStart
-            });
-          }
+          write({
+            type: 'tts_audio',
+            index: ttsIndex++,
+            // Send exact chunk so frontend captions match what's spoken
+            text: chunkRaw,
+            spokenUpTo,
+            audioUrl: `/api/tts/${token}`
+          });
         }
       } catch (e) {
         if (!abortController.signal.aborted) {
-          console.error('TTS queue error:', e);
+          console.error('TTS token queue error:', e);
           write({ type: 'tts_error', error: e.message || 'TTS failed' });
-        }
-      } finally {
-        ttsProcessing = false;
-        if (ttsResolve && !ttsQueue.length) {
-          const r = ttsResolve;
-          ttsResolve = null;
-          r();
         }
       }
     };
@@ -1052,7 +1044,8 @@ export const chatStream = async (req, res) => {
         if (msSinceFirstToken >= 650 && trimmedLen >= 18) {
           // Cut at a reasonable boundary (space) to avoid mid-word.
           const maxLen = 120;
-          const endIdx = _findSafeCutIndex(pendingSpeak, maxLen, 10);
+          let endIdx = _findSafeCutIndex(pendingSpeak, maxLen, 10);
+          endIdx = _extendCutToAvoidTinyTail(pendingSpeak, endIdx, { maxOverflow: 40, minTailChars: 18 });
           const forced = pendingSpeak.slice(0, endIdx);
           pendingSpeak = pendingSpeak.slice(endIdx);
           ttsQueue.push(forced);
@@ -1060,7 +1053,6 @@ export const chatStream = async (req, res) => {
         }
       }
       if (ttsQueue.length) {
-        // async drain
         drainTtsQueue();
       }
     };
@@ -1118,16 +1110,13 @@ export const chatStream = async (req, res) => {
       drainTtsQueue();
     }
 
-    // Wait for TTS queue to finish before closing response
-    await ttsIdle();
-
     // Persist assistant message + audio segments
     conversation.messages.push({ role: 'assistant', content: finalAiResponse });
-    conversation.audioSegments = conversation.audioSegments || [];
-    if (audioSegmentIds.length) {
-      conversation.audioSegments.push(...audioSegmentIds);
-    }
     await conversation.save();
+
+    // Ensure we capture TTS first-byte for correct latency metrics.
+    // The /api/tts/:token endpoint sets this when the browser starts fetching audio.
+    await waitForTurnMetric(turnId, 'ttsFirstByteAt', 2500, 25);
 
     // Update call history: messages, cost, latency
     const userId = publicToken ? (conversation.userId || null) : req.userId;
@@ -1152,9 +1141,10 @@ export const chatStream = async (req, res) => {
         clientTimings && typeof clientTimings.asr_final_ms === 'number' ? clientTimings.asr_final_ms : null;
       const llmFirstTokenMs = firstTokenAt ? firstTokenAt - startedAt : null;
       const llmTotalMs = llmDoneAt ? llmDoneAt - startedAt : Date.now() - startedAt;
-      const ttsFirstAudioMs = firstTtsAt ? firstTtsAt - startedAt : null;
-      const ttsTotalMs = ttsDoneAt ? ttsDoneAt - startedAt : null;
-      const e2eFirstAudioMs = firstTtsAt ? firstTtsAt - startedAt : null;
+      const tm = getTurnMetrics(turnId);
+      const ttsFirstAudioMs = tm?.ttsFirstByteAt ? tm.ttsFirstByteAt - startedAt : null;
+      const ttsTotalMs = tm?.ttsLastByteAt ? tm.ttsLastByteAt - startedAt : null;
+      const e2eFirstAudioMs = ttsFirstAudioMs;
 
       callRecord.latencyTurns = callRecord.latencyTurns || [];
       callRecord.latencyTurns.push({
@@ -1188,13 +1178,14 @@ export const chatStream = async (req, res) => {
       latency: {
         llmFirstTokenMs: firstTokenAt ? firstTokenAt - startedAt : null,
         llmTotalMs: llmDoneAt ? llmDoneAt - startedAt : null,
-        ttsFirstAudioMs: firstTtsAt ? firstTtsAt - startedAt : null,
-        ttsTotalMs: ttsDoneAt ? ttsDoneAt - startedAt : null,
-        e2eFirstAudioMs: firstTtsAt ? firstTtsAt - startedAt : null
+        ttsFirstAudioMs: getTurnMetrics(turnId)?.ttsFirstByteAt ? getTurnMetrics(turnId).ttsFirstByteAt - startedAt : null,
+        ttsTotalMs: getTurnMetrics(turnId)?.ttsLastByteAt ? getTurnMetrics(turnId).ttsLastByteAt - startedAt : null,
+        e2eFirstAudioMs: getTurnMetrics(turnId)?.ttsFirstByteAt ? getTurnMetrics(turnId).ttsFirstByteAt - startedAt : null
       }
     });
     write({ type: 'final', text: finalAiResponse, shouldEndCall: !!shouldEndCall });
     write({ type: 'done' });
+    finalizeTurnMetrics(turnId);
     res.end();
   } catch (error) {
     const isAborted = abortController.signal?.aborted;
@@ -1254,22 +1245,16 @@ export const getCuttingPhrase = async (req, res) => {
       const cuttingVoiceId = speechSettings.voiceId || config.elevenlabs.voiceId;
       console.log('🔊 Cutting phrase voice:', cuttingVoiceId, speechSettings.voiceName);
       
-      const cuttingAudioFileId = await textToSpeech(cuttingPhrase.trim(), {
+      const token = createTtsToken({
+        text: cuttingPhrase.trim(),
         voiceId: cuttingVoiceId,
         modelId: speechSettings.modelId || config.elevenlabs.modelId,
         stability: speechSettings.stability ?? 0.5,
         similarity_boost: speechSettings.similarityBoost ?? 0.75,
-        type: 'conversation' // Will be saved as temporary segment
+        optimize_streaming_latency: 3,
+        turnId: null
       });
-      
-      // Track this audio segment in conversation for later merging
-      if (conversation && cuttingAudioFileId) {
-        conversation.audioSegments = conversation.audioSegments || [];
-        conversation.audioSegments.push(cuttingAudioFileId);
-        await conversation.save();
-      }
-      // Return URL to access the audio from GridFS
-      cuttingAudioUrl = toAudioUrl(cuttingAudioFileId);
+      cuttingAudioUrl = `/api/tts/${token}`;
     } catch (ttsError) {
       console.error('Error generating cutting phrase audio:', ttsError);
     }
@@ -1380,7 +1365,9 @@ export const endConversation = async (req, res) => {
           content: msg.content
         }));
       
-      // Merge all audio segments into one full conversation audio file
+      // If legacy calls created GridFS segments, keep merging them.
+      // For the new low-latency flow we do NOT store per-chunk segments; instead we create
+      // a single recording at end (one write) from assistant messages.
       if (conversation.audioSegments && conversation.audioSegments.length > 0) {
         try {
           console.log(`🔗 Merging ${conversation.audioSegments.length} audio segments for conversation ${conversation._id}`);
@@ -1388,12 +1375,8 @@ export const endConversation = async (req, res) => {
             conversation.audioSegments,
             conversation._id.toString()
           );
-          
-          // Store the merged audio file ID in call history
           callRecord.audioUrl = toAudioUrl(mergedAudioFileId);
           console.log(`✅ Full conversation audio saved: ${mergedAudioFileId}`);
-          
-          // Delete temporary audio segments after merging
           try {
             await deleteTemporaryAudioSegments(conversation.audioSegments);
           } catch (deleteError) {
@@ -1401,7 +1384,33 @@ export const endConversation = async (req, res) => {
           }
         } catch (mergeError) {
           console.error('❌ Error merging conversation audio:', mergeError);
-          // Continue without audio if merge fails
+        }
+      } else if (!callRecord.audioUrl) {
+        try {
+          const assistantText = conversation.messages
+            .filter((m) => m.role === 'assistant')
+            .map((m) => m.content)
+            .filter(Boolean)
+            .join('\n\n')
+            .trim();
+
+          if (assistantText) {
+            // Best-effort: create one stored recording for call history (one write).
+            const agent = conversation.agentId ? await Agent.findOne({ _id: conversation.agentId }) : null;
+            const speechSettings = agent?.speechSettings || {};
+            const voiceId = speechSettings.voiceId || config.elevenlabs.voiceId;
+            const modelId = speechSettings.modelId || config.elevenlabs.modelId;
+            const fileId = await textToSpeech(assistantText, {
+              voiceId,
+              modelId,
+              stability: speechSettings.stability ?? 0.5,
+              similarity_boost: speechSettings.similarityBoost ?? 0.75,
+              type: 'full_conversation'
+            });
+            callRecord.audioUrl = toAudioUrl(fileId);
+          }
+        } catch (e) {
+          console.error('⚠️ Failed to create end-of-call recording (non-critical):', e);
         }
       }
     }
