@@ -59,3 +59,51 @@ export const deleteCallHistory = async (req, res) => {
   }
 };
 
+/**
+ * Get live stats for a conversation (for Agent header UI)
+ */
+export const getCallStatsByConversation = async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    if (!conversationId) {
+      return res.status(400).json({ error: 'conversationId is required' });
+    }
+
+    const call = await CallHistory.findOne({
+      conversationId,
+      userId: req.userId
+    }).sort({ startTime: -1 });
+
+    if (!call) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+
+    const now = new Date();
+    const elapsedSec = Math.max(1, Math.floor((now - new Date(call.startTime)) / 1000));
+    const costPerMin = call.cost ? (call.cost / (elapsedSec / 60)) : 0;
+
+    const turns = call.latencyTurns || [];
+    const latVals = turns.map(t => t?.e2eFirstAudioMs).filter(v => typeof v === 'number' && Number.isFinite(v));
+    const tokVals = turns.map(t => t?.tokensUsed).filter(v => typeof v === 'number' && Number.isFinite(v));
+    const model = turns.length ? (turns[turns.length - 1]?.llmModel || null) : null;
+
+    const stats = {
+      callId: call._id.toString(),
+      conversationId: call.conversationId?.toString?.() || String(conversationId),
+      agentId: call.agentId?.toString?.() || null,
+      agentName: call.agentName || null,
+      status: call.status,
+      costTotal: call.cost || 0,
+      costPerMin: costPerMin || 0,
+      latencyRangeMs: latVals.length ? { min: Math.min(...latVals), max: Math.max(...latVals) } : null,
+      tokensRange: tokVals.length ? { min: Math.min(...tokVals), max: Math.max(...tokVals) } : null,
+      llmModel: model
+    };
+
+    res.json(stats);
+  } catch (error) {
+    console.error('Error fetching call stats:', error);
+    res.status(500).json({ error: 'Failed to fetch call stats' });
+  }
+};
+

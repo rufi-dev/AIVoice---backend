@@ -79,6 +79,8 @@ const callHistorySchema = new mongoose.Schema({
       {
         userText: { type: String, default: '' },
         mode: { type: String, default: 'chunked_tts' },
+        llmModel: { type: String, default: null },
+        tokensUsed: { type: Number, default: null },
         asrFinalMs: { type: Number, default: null },
         llmFirstTokenMs: { type: Number, default: null },
         llmTotalMs: { type: Number, default: null },

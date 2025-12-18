@@ -256,7 +256,9 @@ export const chat = async (req, res) => {
       }
     }
     const speechSettings = agent?.speechSettings || {};
-    const openaiModel = speechSettings.openaiModel || 'gpt-4';
+    // Speed-first default for voice streaming (Retell-like). Users can still set GPT-4 in UI,
+    // but GPT-4o-mini is typically much faster and avoids TPM issues.
+    const openaiModel = speechSettings.openaiModel || 'gpt-4o-mini';
     const language = speechSettings.language || 'en';
     const functions = agent?.functions || [];
     
@@ -1032,7 +1034,7 @@ export const chatStream = async (req, res) => {
         model: openaiModel,
         temperature: 0.7,
         // Voice calls shouldn't generate huge essays; smaller output is faster.
-        max_tokens: 260,
+        max_tokens: 220,
         tools: tools.length > 0 ? tools : undefined,
         tool_choice: 'auto',
         signal: abortController.signal
@@ -1119,6 +1121,8 @@ export const chatStream = async (req, res) => {
       callRecord.latencyTurns.push({
         userText: message,
         mode: 'chunked_tts',
+        llmModel: openaiModel,
+        tokensUsed: typeof tokensUsed === 'number' ? tokensUsed : null,
         asrFinalMs,
         llmFirstTokenMs,
         llmTotalMs,
