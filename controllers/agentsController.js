@@ -32,7 +32,8 @@ export const getAgent = async (req, res) => {
     const agentWithId = {
       ...agentObj,
       id: agent._id.toString(),
-      knowledgeBaseId: agentObj.knowledgeBaseId ? agentObj.knowledgeBaseId.toString() : null
+      knowledgeBaseId: agentObj.knowledgeBaseId ? agentObj.knowledgeBaseId.toString() : null,
+      knowledgeBaseIds: (agentObj.knowledgeBaseIds || []).map(id => id ? id.toString() : id).filter(id => id)
     };
     res.json(agentWithId);
   } catch (error) {
@@ -73,7 +74,7 @@ export const createAgent = async (req, res) => {
 
 export const updateAgent = async (req, res) => {
   try {
-    const { systemPrompt, knowledgeBaseId, speechSettings, callSettings, functions, isPublic } = req.body;
+    const { systemPrompt, knowledgeBaseId, knowledgeBaseIds, speechSettings, callSettings, functions, isPublic } = req.body;
     
     console.log('💾 Updating agent with speechSettings:', {
       voiceId: speechSettings?.voiceId,
@@ -83,9 +84,20 @@ export const updateAgent = async (req, res) => {
     
     const updateData = {};
     if (systemPrompt !== undefined) updateData.systemPrompt = systemPrompt;
-    if (knowledgeBaseId !== undefined) {
-      // Convert empty string to null, otherwise keep the value
-      updateData.knowledgeBaseId = knowledgeBaseId && knowledgeBaseId.trim() !== '' ? knowledgeBaseId : null;
+    if (knowledgeBaseIds !== undefined) {
+      // Support multiple knowledge bases
+      updateData.knowledgeBaseIds = Array.isArray(knowledgeBaseIds) ? knowledgeBaseIds.filter(id => id && id.trim() !== '') : [];
+      // Also set knowledgeBaseId to first one for backward compatibility
+      if (updateData.knowledgeBaseIds.length > 0) {
+        updateData.knowledgeBaseId = updateData.knowledgeBaseIds[0];
+      } else {
+        updateData.knowledgeBaseId = null;
+      }
+    } else if (knowledgeBaseId !== undefined) {
+      // Legacy support: single knowledgeBaseId
+      const kbId = knowledgeBaseId && knowledgeBaseId.trim() !== '' ? knowledgeBaseId : null;
+      updateData.knowledgeBaseId = kbId;
+      updateData.knowledgeBaseIds = kbId ? [kbId] : [];
     }
     if (speechSettings !== undefined) {
       // Ensure voiceId is always included if speechSettings is provided
@@ -130,7 +142,8 @@ export const updateAgent = async (req, res) => {
     const agentWithId = {
       ...agentObj,
       id: agent._id.toString(),
-      knowledgeBaseId: agentObj.knowledgeBaseId ? agentObj.knowledgeBaseId.toString() : null
+      knowledgeBaseId: agentObj.knowledgeBaseId ? agentObj.knowledgeBaseId.toString() : null,
+      knowledgeBaseIds: (agentObj.knowledgeBaseIds || []).map(id => id ? id.toString() : id).filter(id => id)
     };
     res.json(agentWithId);
   } catch (error) {

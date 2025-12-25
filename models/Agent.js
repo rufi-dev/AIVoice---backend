@@ -21,6 +21,11 @@ const agentSchema = new mongoose.Schema({
     ref: 'KnowledgeBase',
     default: null
   },
+  knowledgeBaseIds: {
+    type: [mongoose.Schema.Types.ObjectId],
+    ref: 'KnowledgeBase',
+    default: []
+  },
   speechSettings: {
     voiceId: {
       type: String,
@@ -59,7 +64,16 @@ const agentSchema = new mongoose.Schema({
   },
   callSettings: {
     aiSpeaksFirst: Boolean,
-    pauseBeforeSpeaking: Number
+    pauseBeforeSpeaking: Number,
+    welcomeMessageType: {
+      type: String,
+      enum: ['dynamic', 'custom'],
+      default: 'dynamic'
+    },
+    customWelcomeMessage: {
+      type: String,
+      default: ''
+    }
   },
   functions: [{
     name: {

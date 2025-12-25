@@ -74,6 +74,55 @@ const callHistorySchema = new mongoose.Schema({
     type: String,
     default: null // Full conversation audio file ID in GridFS
   },
+  // --- Realtime (LiveKit) call fields ---
+  roomName: {
+    type: String,
+    default: null,
+    index: true
+  },
+  provider: {
+    type: String,
+    enum: ['web', 'pstn'],
+    default: 'web'
+  },
+  recordingProvider: {
+    type: String,
+    enum: ['livekit_egress', null],
+    default: null
+  },
+  recordingUrl: {
+    type: String,
+    default: null
+  },
+  egressId: {
+    type: String,
+    default: null,
+    index: true
+  },
+  callSid: {
+    type: String,
+    default: null,
+    index: true
+  },
+  // Retell-like realtime metrics (aggregated server-side over turns)
+  metrics: {
+    avgVadEndToPlayoutStartMs: { type: Number, default: null },
+    turns: {
+      type: [
+        {
+          turnId: { type: String, default: null },
+          // timestamps are epoch ms (client/server clocks may differ; use relative deltas where possible)
+          vadEndAt: { type: Number, default: null },
+          llmFirstTokenAt: { type: Number, default: null },
+          ttsFirstFrameAt: { type: Number, default: null },
+          clientPlayoutStartAt: { type: Number, default: null },
+          vadEndToPlayoutStartMs: { type: Number, default: null },
+          createdAt: { type: Date, default: Date.now }
+        }
+      ],
+      default: []
+    }
+  },
   latencyTurns: {
     type: [
       {

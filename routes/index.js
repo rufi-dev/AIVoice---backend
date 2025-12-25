@@ -5,6 +5,7 @@ import knowledgeBasesRoutes from './knowledgeBases.js';
 import conversationsRoutes from './conversations.js';
 import callHistoryRoutes from './callHistory.js';
 import voicesRoutes from './voices.js';
+import realtimeRoutes from './realtime.js';
 import { authenticate, optionalAuth } from '../middleware/auth.js';
 import { serveAudioFromGridFS } from '../controllers/audioController.js';
 import { getStorageStats, cleanupAudio } from '../controllers/audioManagementController.js';
@@ -36,6 +37,8 @@ router.use('/knowledge-bases', authenticate, knowledgeBasesRoutes);
 router.use('/conversation', optionalAuth, conversationsRoutes);
 router.use('/call-history', authenticate, callHistoryRoutes);
 router.use('/voices', authenticate, voicesRoutes);
+// Realtime (LiveKit) supports authenticated and public-token access
+router.use('/realtime', optionalAuth, realtimeRoutes);
 router.get('/audio-stats', authenticate, getStorageStats);
 router.post('/audio-cleanup', authenticate, cleanupAudio);
 

@@ -45,12 +45,30 @@ const startServer = async () => {
       console.warn('⚠️ Could not start audio cleanup scheduler:', error.message);
     }
     
-    app.listen(config.port, () => {
+    const server = app.listen(config.port, () => {
       console.log(`🚀 Server running on http://localhost:${config.port}`);
       console.log(`📝 Make sure to set OPENAI_API_KEY and ELEVENLABS_API_KEY in .env file`);
       console.log(`💾 Database: ${config.database.uri}`);
       console.log(`🧹 Audio cleanup scheduler: Running daily`);
     });
+
+    // Graceful shutdown: stop all Python workers on server exit
+    const shutdown = async (signal) => {
+      console.log(`\n${signal} received, shutting down gracefully...`);
+      try {
+        const { stopAllWorkers } = await import('./services/workerSpawner.js');
+        await stopAllWorkers();
+      } catch (error) {
+        console.error('Error stopping workers:', error);
+      }
+      server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+      });
+    };
+
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
   } catch (error) {
     console.error('Failed to start server:', error);
     process.exit(1);
